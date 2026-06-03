@@ -4,8 +4,8 @@
 *.dev.o
 *.elf
 *.epf
-xj380_emu
-xj380_emu.exe
+xswl
+xswl.exe
 test_unicorn
 test_xj380.c
 

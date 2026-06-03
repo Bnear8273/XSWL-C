@@ -2,9 +2,9 @@
 #define _DEFAULT_SOURCE
 
 /*
- * xj380_emu.c — XJ380 高性能二进制模拟器核心
+ * xj380_emu.c — XSWL 重制版 (笑死我了重制版) 核心
  *
- * Unicorn C API + ELF 加载 + xapi syscall 分发 + VFS。
+ * XJ380 二进制模拟器: Unicorn C API + ELF 加载 + syscall 分发 + VFS。
  * 无 Python 层, 全路径 C 级别直通。
  */
 

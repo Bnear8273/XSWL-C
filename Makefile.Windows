@@ -1,12 +1,10 @@
-# XJ380 Emulator — Windows Cygwin Makefile
+# XSWL 重制版 (笑死我了重制版) — Windows Cygwin Makefile
 #
 #   make -f Makefile.Windows          TUI only
 #   make -f Makefile.Windows gui      TUI + SDL2 GUI
 #   make -f Makefile.Windows release  g++ -O3 -flto
-#
-# Cygwin 依赖: gcc-core gcc-g++ make libunicorn-devel libSDL2-devel libSDL2_image-devel
 
-TARGET    = xj380_emu.exe
+TARGET    = xswl.exe
 TEST_ELF  = test_xj380.elf
 TUI_ELF   = test_tui.elf
 

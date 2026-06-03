@@ -1,10 +1,10 @@
-# XJ380 Emulator Makefile
+# XSWL 重制版 (笑死我了重制版) — Makefile
 #   make          — gcc -O3 (默认)
 #   make gui      — gcc -O3 + SDL2 GUI
 #   make dev      — clang + sanitizers + trace
 #   make release  — gcc + g++ 链接 -O3 -flto
 
-TARGET    = xj380_emu
+TARGET    = xswl
 INC       = -I/usr/include -I/usr/include/SDL2
 LIBS_TUI  = -lunicorn -lm
 LIBS_GUI  = -lunicorn -lSDL2 -lSDL2_image -lm
