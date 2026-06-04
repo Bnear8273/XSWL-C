@@ -8,8 +8,7 @@ TARGET    = xswl
 INC       = -I/usr/include -I/usr/include/SDL2
 LIBS_TUI  = -lunicorn -lm
 LIBS_GUI  = -lunicorn -lSDL2 -lSDL2_image -lm
-TEST_ELF  = test_xj380.elf
-TUI_ELF   = test_tui.elf
+TEST_ELF  = test_file.elf
 
 SRC_TUI   = main.c xj380_emu.c
 SRC_GUI   = main.c xj380_emu.c xj380_gui.c
@@ -64,22 +63,16 @@ release:
 	rm -f *.rel.o
 
 # === 测试 ===
-$(TEST_ELF): test_xj380.S
+$(TEST_ELF): test_file.S
 	gcc -m64 -nostdlib -static -no-pie -o $@ $< -Wl,-Ttext=0x200000
 
-$(TUI_ELF): test_tui.S
-	gcc -m64 -nostdlib -static -no-pie -o $@ $< -Wl,-Ttext=0x200000
-
-.PHONY: test test-tui test-real
+.PHONY: test test-real
 test: $(TARGET) $(TEST_ELF)
 	./$(TARGET) $(TEST_ELF)
-
-test-tui: $(TARGET) $(TUI_ELF)
-	./$(TARGET) $(TUI_ELF)
 
 test-real: $(TARGET)
 	./$(TARGET) /home/bnear8273/Develop/Projects/XSWL/main.epf
 
 .PHONY: clean
 clean:
-	rm -f $(TARGET) $(TEST_ELF) $(TUI_ELF) *.o *.dev.o *.rel.o
+	rm -f $(TARGET) $(TEST_ELF) *.o *.dev.o *.rel.o

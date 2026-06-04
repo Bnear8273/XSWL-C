@@ -176,6 +176,9 @@ static int vfs_import_host(xj380_emu_t *emu, const char *vpath, const char *hpat
     fclose(fp);
     int idx = emu->vfs_count++;
     strncpy(emu->vfs[idx].path, vpath, VFS_PATH_MAX - 1);
+#ifdef XJ380_GUI
+    xj380_gui_load_font(vpath, d, sz);
+#endif
     emu->vfs[idx].data   = d;
     emu->vfs[idx].size   = sz;
     emu->vfs[idx].is_dir = false;
@@ -790,6 +793,7 @@ static void h_OPENFILE(xj380_emu_t *e) {
                 idx = vfs_create(e, p, false);
                 if (idx < 0) { w(e, UC_X86_REG_RAX, 0); return; }
             } else {
+                fprintf(stderr, "[xj380] OpenFile 失败: '%s' 不存在\n", p);
                 w(e, UC_X86_REG_RAX, 0);
                 return;
             }
@@ -1108,7 +1112,11 @@ static void h_OPEN(xj380_emu_t *e) {
     if (idx < 0) {
         const char *hp = (*p == '/') ? p + 1 : p;
         idx = vfs_import_host(e, p, hp);
-        if (idx < 0) { w(e, UC_X86_REG_RAX, UINT64_MAX); return; }
+        if (idx < 0) {
+            fprintf(stderr, "[xj380] Open 失败: '%s' 不存在\n", p);
+            w(e, UC_X86_REG_RAX, UINT64_MAX);
+            return;
+        }
     }
     w(e, UC_X86_REG_RAX, (uint64_t)(idx + 3));
 }

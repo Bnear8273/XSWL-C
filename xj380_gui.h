@@ -96,6 +96,7 @@ void xj380_gui_render_all(xj380_emu_t *emu);
 int  xj380_gui_window_count(void);
 void xj380_gui_flush_events(xj380_emu_t *emu);
 void xj380_gui_store_callback(xj380_emu_t *emu, uint64_t handle, uint64_t func);
+void xj380_gui_load_font(const char *vpath, const uint8_t *data, size_t size);
 
 /* 模拟器内存访问 (从 xj380_emu.c 导出) */
 int  xj380_mem_read(xj380_emu_t *emu, uint64_t addr, void *dst, size_t len);

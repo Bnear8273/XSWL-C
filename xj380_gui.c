@@ -18,6 +18,9 @@
 #include <unicorn/unicorn.h>
 #include <unicorn/x86.h>
 
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wshadow"
 #pragma GCC diagnostic ignored "-Wsign-conversion"
@@ -344,27 +347,86 @@ void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
     char text[4096];
     xj380_mem_read_str(emu, str_ptr, text, sizeof(text));
 
-    /* 用 SDL2 内置的简单文本渲染 (通过 SDL2_ttf 更专业, 这里偷懒画点) */
-    /* 简单等宽字体: 8x16 per char, 按 size 缩放 */
-    int char_w = 8  * (int)(size ? size : 2);
-    int char_h = 16 * (int)(size ? size : 2);
-    if (char_w < 4) char_w = 4;
-    if (char_h < 8) char_h = 8;
+    /* 尝试用缓存字体渲染 */
+    cached_font_t *cf = find_font("/system/font/XJ380C.ttf");
+    if (!cf) cf = find_font("/system/font/XJ380F.ttf");
+    if (!cf && g_font_count > 0) cf = &g_fonts[0];
 
-    int cx = (int)x, cy = (int)y;
-    for (char *p = text; *p; p++) {
-        if (*p == '\n') { cx = (int)x; cy += char_h; continue; }
-        /* 简单占位: 画一个色块表示字符 */
-        uint8_t ch = (uint8_t)*p;
-        uint8_t r = (uint8_t)((ch * 37)  & 0xFF);
-        uint8_t g = (uint8_t)((ch * 73)  & 0xFF);
-        uint8_t b = (uint8_t)((ch * 137) & 0xFF);
-        uint32_t c = (rgba & 0xFF000000) | (r << 16) | (g << 8) | b;
-        for (int dy = 0; dy < char_h - 1 && cy + dy < gw->height; dy++)
-            for (int dx = 0; dx < char_w - 1 && cx + dx < gw->width; dx++)
-                set_pixel(gw, cx + dx, cy + dy, c);
-        cx += char_w;
-        if (cx + char_w > gw->width) { cx = (int)x; cy += char_h; }
+    if (cf) {
+        float scale = stbtt_ScaleForPixelHeight(&cf->info, (float)(size ? size : 12));
+        int ascent, descent, line_gap;
+        stbtt_GetFontVMetrics(&cf->info, &ascent, &descent, &line_gap);
+        int baseline = (int)(ascent * scale);
+        int line_h   = (int)((ascent - descent + line_gap) * scale);
+
+        float cx = (float)x;
+        float cy = (float)y + baseline;
+        for (char *p = text; *p; p++) {
+            if (*p == '\n') { cx = (float)x; cy += line_h; continue; }
+
+            int adv, lsb, x0, y0, x1, y1;
+            float gpx_x, gpx_y;
+            /* 获取字符度量 */
+            stbtt_GetCodepointHMetrics(&cf->info, (int)(unsigned char)*p, &adv, &lsb);
+            stbtt_GetCodepointBitmapBox(&cf->info, (int)(unsigned char)*p, scale, scale,
+                                        &x0, &y0, &x1, &y1);
+
+            int gw_w = x1 - x0, gw_h = y1 - y0;
+            if (gw_w > 0 && gw_h > 0) {
+                uint8_t *glyph = malloc((size_t)(gw_w * gw_h));
+                if (glyph) {
+                    stbtt_MakeCodepointBitmap(&cf->info, glyph, gw_w, gw_h, gw_w,
+                                              scale, scale, (int)(unsigned char)*p);
+
+                    uint8_t ar = (uint8_t)((rgba >> 16) & 0xFF);
+                    uint8_t ag = (uint8_t)((rgba >>  8) & 0xFF);
+                    uint8_t ab = (uint8_t)( rgba        & 0xFF);
+                    uint8_t aa_scale = (uint8_t)((rgba >> 24) & 0xFF);
+
+                    /* Alpha 混合到 framebuffer */
+                    int dx = (int)cx + x0;
+                    int dy = (int)cy + y0;
+                    for (int gy = 0; gy < gw_h; gy++) {
+                        for (int gx = 0; gx < gw_w; gx++) {
+                            int px = dx + gx, py = dy + gy;
+                            if (px < 0 || py < 0 || px >= gw->width || py >= gw->height)
+                                continue;
+                            uint8_t a = (uint8_t)((unsigned)glyph[gy * gw_w + gx] *
+                                         (unsigned)aa_scale / 255);
+                            if (a == 0) continue;
+                            if (a == 255) {
+                                gw->fb[py * gw->width + px] = rgba;
+                            } else {
+                                uint32_t bg = gw->fb[py * gw->width + px];
+                                uint8_t br = (uint8_t)((bg >> 16) & 0xFF);
+                                uint8_t bg2 = (uint8_t)((bg >>  8) & 0xFF);
+                                uint8_t bb = (uint8_t)( bg        & 0xFF);
+                                uint8_t fr = (uint8_t)(((unsigned)ar * a + (unsigned)br * (255-a)) / 255);
+                                uint8_t fg = (uint8_t)(((unsigned)ag * a + (unsigned)bg2* (255-a)) / 255);
+                                uint8_t fb2= (uint8_t)(((unsigned)ab * a + (unsigned)bb * (255-a)) / 255);
+                                gw->fb[py * gw->width + px] = 0xFF000000 |
+                                    ((uint32_t)fr << 16) | ((uint32_t)fg << 8) | fb2;
+                            }
+                        }
+                    }
+                    free(glyph);
+                }
+            }
+            cx += adv * scale;
+            if (cx > gw->width) { cx = (float)x; cy += line_h; }
+        }
+    } else {
+        /* 无字体回退: 色块占位 */
+        int cw = 8, ch = 16;
+        int px = (int)x, py = (int)y;
+        for (char *p = text; *p; p++) {
+            if (*p == '\n') { px = (int)x; py += ch; continue; }
+            for (int dy = 0; dy < ch && py+dy < gw->height; dy++)
+                for (int dx = 0; dx < cw && px+dx < gw->width; dx++)
+                    set_pixel(gw, px+dx, py+dy, rgba);
+            px += cw;
+            if (px + cw > gw->width) { px = (int)x; py += ch; }
+        }
     }
 }
 
@@ -683,6 +745,57 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
     }
 
     return 0;
+}
+
+/* ---- TTF 字体缓存 ---- */
+#define MAX_FONTS 8
+typedef struct {
+    char           path[512];
+    stbtt_fontinfo info;
+    uint8_t       *data;
+    size_t         size;
+    float          scale;
+} cached_font_t;
+
+static cached_font_t g_fonts[MAX_FONTS];
+static int           g_font_count;
+
+static cached_font_t* find_font(const char *path)
+{
+    /* 找已缓存的字体, 没找到则返回最近加载的 */
+    for (int i = 0; i < g_font_count; i++)
+        if (strcmp(g_fonts[i].path, path) == 0) return &g_fonts[i];
+    return g_font_count > 0 ? &g_fonts[0] : NULL;
+}
+
+void xj380_gui_load_font(const char *vpath, const uint8_t *data, size_t size)
+{
+    if (!data || !size || g_font_count >= MAX_FONTS) return;
+    /* 只缓存 TTF/OTF */
+    const char *ext = strrchr(vpath, '.');
+    if (!ext || (strcasecmp(ext, ".ttf") && strcasecmp(ext, ".otf"))) return;
+
+    /* 检查是否已缓存 */
+    for (int i = 0; i < g_font_count; i++)
+        if (strcmp(g_fonts[i].path, vpath) == 0) return;
+
+    /* 解析字体 */
+    cached_font_t *cf = &g_fonts[g_font_count];
+    memset(cf, 0, sizeof(*cf));
+    strncpy(cf->path, vpath, 511);
+    cf->data = malloc(size);
+    if (!cf->data) return;
+    memcpy(cf->data, data, size);
+    cf->size = size;
+
+    if (!stbtt_InitFont(&cf->info, cf->data, stbtt_GetFontOffsetForIndex(cf->data, 0))) {
+        free(cf->data);
+        cf->data = NULL;
+        return;
+    }
+    cf->scale = stbtt_ScaleForPixelHeight(&cf->info, 16.0f);
+    g_font_count++;
+    printf("[GUI] 字体加载: %s (%zu bytes)\n", vpath, size);
 }
 
 #define EVT_RETURN_TRAMP 0xFFFFF000ULL  /* 事件回调返回 trampoline */
