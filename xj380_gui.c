@@ -61,6 +61,8 @@ typedef struct {
     bool          open;
     bool          fullscreen;
     bool          resizable;
+    bool          dirty;
+    SDL_Rect      dirty_rect;
 
     /* 控件 */
     struct {
@@ -229,17 +231,55 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
 
     SDL_Renderer *rend = SDL_CreateRenderer(win, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    SDL_Texture  *tex  = SDL_CreateTexture(rend,
+    if (!rend)
+    {
+        fprintf(stderr, "[GUI] SDL_CreateRenderer 失败: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        uint64_t zero = 0;
+        xj380_mem_write(emu, handle_ptr, &zero, 8);
+        return;
+    }
+
+    SDL_Texture *tex = SDL_CreateTexture(rend,
         SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING,
         (int)width, (int)height);
+    if (!tex)
+    {
+        fprintf(stderr, "[GUI] SDL_CreateTexture 失败: %s\n", SDL_GetError());
+        SDL_DestroyRenderer(rend);
+        SDL_DestroyWindow(win);
+        uint64_t zero = 0;
+        xj380_mem_write(emu, handle_ptr, &zero, 8);
+        return;
+    }
 
-    /* 分配 framebuffer */
     uint32_t *fb = calloc((size_t)width * (size_t)height, sizeof(uint32_t));
-    /* 填充白色 */
-    for (int i = 0; i < (int)(width * height); i++) fb[i] = 0xFFFFFFFF;
+    if (!fb)
+    {
+        SDL_DestroyTexture(tex);
+        SDL_DestroyRenderer(rend);
+        SDL_DestroyWindow(win);
+        uint64_t zero = 0;
+        xj380_mem_write(emu, handle_ptr, &zero, 8);
+        return;
+    }
 
-    /* 注册 */
+    for (uint32_t i = 0; i < width * height; i++)
+    {
+        fb[i] = 0xFFFFFFFFU;
+    }
+
     gui_window_t *gw = calloc(1, sizeof(*gw));
+    if (!gw)
+    {
+        free(fb);
+        SDL_DestroyTexture(tex);
+        SDL_DestroyRenderer(rend);
+        SDL_DestroyWindow(win);
+        uint64_t zero = 0;
+        xj380_mem_write(emu, handle_ptr, &zero, 8);
+        return;
+    }
     gw->handle     = g_next_handle++;
     gw->win        = win;
     gw->rend       = rend;
@@ -250,6 +290,8 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
     gw->open       = true;
     gw->fullscreen = (sets & XWIN_FULL_SCR) != 0;
     gw->resizable  = (sets & XWIN_SUPPORT_RESIZEABLE) != 0;
+    gw->dirty      = true;
+    gw->dirty_rect = (SDL_Rect){0, 0, gw->width, gw->height};
     copy_cstr(gw->title, sizeof(gw->title), title);
 
     g_windows[g_window_count++] = gw;
@@ -301,10 +343,62 @@ void xj380_gui_set_window_title(xj380_emu_t *emu, uint64_t handle, uint64_t titl
  * 绘图函数
  * ================================================================ */
 
+static bool clip_rect(gui_window_t *gw, uint32_t x, uint32_t y,
+    uint32_t w, uint32_t h, SDL_Rect *rect)
+{
+    uint32_t max_w  = 0;
+    uint32_t max_h  = 0;
+    uint32_t copy_w = 0;
+    uint32_t copy_h = 0;
+
+    if (!gw || !rect || w == 0 || h == 0 || x >= (uint32_t)gw->width
+        || y >= (uint32_t)gw->height)
+    {
+        return false;
+    }
+
+    max_w  = (uint32_t)gw->width - x;
+    max_h  = (uint32_t)gw->height - y;
+    copy_w = (w < max_w) ? w : max_w;
+    copy_h = (h < max_h) ? h : max_h;
+
+    if (copy_w == 0 || copy_h == 0)
+    {
+        return false;
+    }
+
+    *rect = (SDL_Rect){(int)x, (int)y, (int)copy_w, (int)copy_h};
+    return true;
+}
+
+static void mark_dirty(gui_window_t *gw, int x, int y, int w, int h)
+{
+    SDL_Rect clipped;
+
+    if (!clip_rect(gw, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, &clipped))
+    {
+        return;
+    }
+
+    if (!gw->dirty)
+    {
+        gw->dirty      = true;
+        gw->dirty_rect = clipped;
+        return;
+    }
+
+    SDL_UnionRect(&gw->dirty_rect, &clipped, &gw->dirty_rect);
+}
+
 static void set_pixel(gui_window_t *gw, int x, int y, uint32_t rgba)
 {
-    if (x < 0 || y < 0 || x >= gw->width || y >= gw->height) return;
+    if (x < 0 || y < 0 || x >= gw->width || y >= gw->height)
+    {
+        return;
+    }
+
     gw->fb[y * gw->width + x] = rgba;
+    mark_dirty(gw, x, y, 1, 1);
 }
 
 void xj380_gui_draw_point(xj380_emu_t *emu, uint64_t handle,
@@ -523,38 +617,88 @@ void xj380_gui_draw_picture(xj380_emu_t *emu, uint64_t handle,
 void xj380_gui_read_buffer(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t buf_ptr)
 {
-    /* RGBA(4字节) → XCOLOR(3字节 RGB  packed, 无Alpha) */
     gui_window_t *gw = find_window(handle);
-    if (!gw || !buf_ptr) return;
-    for (uint32_t dy = 0; dy < h && (y + dy) < (uint32_t)gw->height; dy++) {
-        for (uint32_t dx = 0; dx < w && (x + dx) < (uint32_t)gw->width; dx++) {
-            uint32_t pixel = gw->fb[(y + dy) * (uint32_t)gw->width + (x + dx)];
-            uint8_t rgb[3];
-            rgb[0] = (uint8_t)((pixel >> 16) & 0xFF); /* R */
-            rgb[1] = (uint8_t)((pixel >>  8) & 0xFF); /* G */
-            rgb[2] = (uint8_t)( pixel        & 0xFF); /* B */
-            uint64_t addr = buf_ptr + (uint64_t)(dy * w + dx) * 3;
-            xj380_mem_write(emu, addr, rgb, 3);
+    SDL_Rect      rect;
+
+    if (!buf_ptr || !clip_rect(gw, x, y, w, h, &rect))
+    {
+        return;
+    }
+
+    size_t row_bytes = (size_t)rect.w * 3U;
+    uint8_t *row     = malloc(row_bytes);
+    if (!row)
+    {
+        return;
+    }
+
+    for (int dy = 0; dy < rect.h; dy++)
+    {
+        uint32_t *src = gw->fb + (rect.y + dy) * gw->width + rect.x;
+
+        for (int dx = 0; dx < rect.w; dx++)
+        {
+            uint32_t pixel = src[dx];
+
+            row[(size_t)dx * 3U + 0U] = (uint8_t)((pixel >> 16) & 0xFFU);
+            row[(size_t)dx * 3U + 1U] = (uint8_t)((pixel >>  8) & 0xFFU);
+            row[(size_t)dx * 3U + 2U] = (uint8_t)( pixel        & 0xFFU);
+        }
+
+        if (xj380_mem_write(
+                emu,
+                buf_ptr + (uint64_t)dy * (uint64_t)w * 3ULL,
+                row,
+                row_bytes) != 0)
+        {
+            break;
         }
     }
+
+    free(row);
 }
 
 void xj380_gui_write_buffer(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t buf_ptr)
 {
-    /* XCOLOR(3字节 RGB) → RGBA(4字节, A=255) */
     gui_window_t *gw = find_window(handle);
-    if (!gw || !buf_ptr) return;
-    for (uint32_t dy = 0; dy < h && (y + dy) < (uint32_t)gw->height; dy++) {
-        for (uint32_t dx = 0; dx < w && (x + dx) < (uint32_t)gw->width; dx++) {
-            uint8_t rgb[3] = {0,0,0};
-            uint64_t addr = buf_ptr + (uint64_t)(dy * w + dx) * 3;
-            xj380_mem_read(emu, addr, rgb, 3);
-            uint32_t pixel = 0xFF000000 | ((uint32_t)rgb[0] << 16) |
-                             ((uint32_t)rgb[1] << 8) | (uint32_t)rgb[2];
-            gw->fb[(y + dy) * (uint32_t)gw->width + (x + dx)] = pixel;
+    SDL_Rect      rect;
+
+    if (!buf_ptr || !clip_rect(gw, x, y, w, h, &rect))
+    {
+        return;
+    }
+
+    size_t row_bytes = (size_t)rect.w * 3U;
+    uint8_t *row     = malloc(row_bytes);
+    if (!row)
+    {
+        return;
+    }
+
+    for (int dy = 0; dy < rect.h; dy++)
+    {
+        if (xj380_mem_read(
+                emu,
+                buf_ptr + (uint64_t)dy * (uint64_t)w * 3ULL,
+                row,
+                row_bytes) != 0)
+        {
+            break;
+        }
+
+        uint32_t *dst = gw->fb + (rect.y + dy) * gw->width + rect.x;
+        for (int dx = 0; dx < rect.w; dx++)
+        {
+            dst[dx] = 0xFF000000U
+                | ((uint32_t)row[(size_t)dx * 3U + 0U] << 16)
+                | ((uint32_t)row[(size_t)dx * 3U + 1U] << 8)
+                |  (uint32_t)row[(size_t)dx * 3U + 2U];
         }
     }
+
+    mark_dirty(gw, rect.x, rect.y, rect.w, rect.h);
+    free(row);
 }
 
 /* ================================================================
@@ -565,13 +709,29 @@ void xj380_gui_refresh_window(xj380_emu_t *emu, uint64_t handle)
 {
     (void)emu;
     gui_window_t *gw = find_window(handle);
-    if (!gw || !gw->open) return;
+    SDL_Rect      rect;
 
-    SDL_UpdateTexture(gw->tex, NULL, gw->fb,
+    if (!gw || !gw->open)
+    {
+        return;
+    }
+
+    rect = gw->dirty ? gw->dirty_rect : (SDL_Rect){0, 0, gw->width, gw->height};
+    if (!clip_rect(gw, (uint32_t)rect.x, (uint32_t)rect.y,
+            (uint32_t)rect.w, (uint32_t)rect.h, &rect))
+    {
+        return;
+    }
+
+    SDL_UpdateTexture(
+        gw->tex,
+        &rect,
+        gw->fb + rect.y * gw->width + rect.x,
         gw->width * (int)sizeof(uint32_t));
     SDL_RenderClear(gw->rend);
     SDL_RenderCopy(gw->rend, gw->tex, NULL, NULL);
     SDL_RenderPresent(gw->rend);
+    gw->dirty = false;
 }
 
 void xj380_gui_refresh_part(xj380_emu_t *emu, uint64_t handle,
@@ -579,19 +739,27 @@ void xj380_gui_refresh_part(xj380_emu_t *emu, uint64_t handle,
 {
     (void)emu;
     gui_window_t *gw = find_window(handle);
-    if (!gw || !gw->open) return;
+    SDL_Rect      rect;
 
-    int w = (int)(x2 - x1);
-    int h = (int)(y2 - y1);
-    if (w <= 0 || h <= 0) return;
+    if (!gw || !gw->open || x1 >= x2 || y1 >= y2)
+    {
+        return;
+    }
 
-    SDL_Rect rect = { (int)x1, (int)y1, w, h };
-    SDL_UpdateTexture(gw->tex, &rect,
-        gw->fb + (int)y1 * gw->width + (int)x1,
+    if (!clip_rect(gw, x1, y1, x2 - x1, y2 - y1, &rect))
+    {
+        return;
+    }
+
+    SDL_UpdateTexture(
+        gw->tex,
+        &rect,
+        gw->fb + rect.y * gw->width + rect.x,
         gw->width * (int)sizeof(uint32_t));
     SDL_RenderClear(gw->rend);
     SDL_RenderCopy(gw->rend, gw->tex, NULL, NULL);
     SDL_RenderPresent(gw->rend);
+    gw->dirty = false;
 }
 
 /* ================================================================
@@ -676,16 +844,51 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
                 if (gw->win)  { SDL_DestroyWindow(gw->win);   gw->win  = NULL; }
                 return 2;  /* 通知调用者: 窗口被用户关闭 */
             case SDL_WINDOWEVENT_RESIZED:
-                gw->width  = ev.window.data1;
-                gw->height = ev.window.data2;
+            {
+                int new_width  = ev.window.data1;
+                int new_height = ev.window.data2;
+
+                if (new_width <= 0 || new_height <= 0
+                    || new_width > FB_MAX_WIDTH || new_height > FB_MAX_HEIGHT)
+                {
+                    break;
+                }
+
+                uint32_t *new_fb = calloc(
+                    (size_t)new_width * (size_t)new_height,
+                    sizeof(uint32_t));
+                SDL_Texture *new_tex = SDL_CreateTexture(
+                    gw->rend,
+                    SDL_PIXELFORMAT_RGBA8888,
+                    SDL_TEXTUREACCESS_STREAMING,
+                    new_width,
+                    new_height);
+
+                if (!new_fb || !new_tex)
+                {
+                    free(new_fb);
+                    if (new_tex)
+                    {
+                        SDL_DestroyTexture(new_tex);
+                    }
+                    break;
+                }
+
                 free(gw->fb);
-                gw->fb = calloc((size_t)gw->width * (size_t)gw->height, sizeof(uint32_t));
-                if (gw->tex) SDL_DestroyTexture(gw->tex);
-                gw->tex = SDL_CreateTexture(gw->rend,
-                    SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING,
-                    gw->width, gw->height);
+                if (gw->tex)
+                {
+                    SDL_DestroyTexture(gw->tex);
+                }
+
+                gw->width      = new_width;
+                gw->height     = new_height;
+                gw->fb         = new_fb;
+                gw->tex        = new_tex;
+                gw->dirty      = true;
+                gw->dirty_rect = (SDL_Rect){0, 0, gw->width, gw->height};
                 queue_event(gw->handle, XJ380_MSG_RESIZE, 0, 0);
                 break;
+            }
             }
             break;
 
@@ -809,6 +1012,7 @@ void xj380_gui_load_font(const char *vpath, const uint8_t *data, size_t size)
 }
 
 #define EVT_RETURN_TRAMP 0xFFFFF000ULL  /* 事件回调返回 trampoline */
+#define EVT_STACK_TOP     0xFFFFEFF0ULL
 
 /*
  * 将排队的事件注入到模拟程序的消息回调中。
@@ -845,14 +1049,34 @@ void xj380_gui_flush_events(xj380_emu_t *emu)
         }
         if (!gw || !gw->msg_callback_addr) continue;
 
-        /* 保存当前 CPU 状态 */
+        /* 保存当前 CPU 状态，事件回调不能污染被打断的 guest 代码。 */
         uint64_t saved_rip = 0, saved_rsp = 0, saved_rflags = 0;
+        uint64_t saved_rax = 0, saved_rbx = 0, saved_rcx = 0, saved_rdx = 0;
+        uint64_t saved_rsi = 0, saved_rdi = 0, saved_rbp = 0;
+        uint64_t saved_r8 = 0, saved_r9 = 0, saved_r10 = 0, saved_r11 = 0;
+        uint64_t saved_r12 = 0, saved_r13 = 0, saved_r14 = 0, saved_r15 = 0;
+
         uc_reg_read(uc, UC_X86_REG_RIP, &saved_rip);
         uc_reg_read(uc, UC_X86_REG_RSP, &saved_rsp);
         uc_reg_read(uc, UC_X86_REG_EFLAGS, &saved_rflags);
+        uc_reg_read(uc, UC_X86_REG_RAX, &saved_rax);
+        uc_reg_read(uc, UC_X86_REG_RBX, &saved_rbx);
+        uc_reg_read(uc, UC_X86_REG_RCX, &saved_rcx);
+        uc_reg_read(uc, UC_X86_REG_RDX, &saved_rdx);
+        uc_reg_read(uc, UC_X86_REG_RSI, &saved_rsi);
+        uc_reg_read(uc, UC_X86_REG_RDI, &saved_rdi);
+        uc_reg_read(uc, UC_X86_REG_RBP, &saved_rbp);
+        uc_reg_read(uc, UC_X86_REG_R8, &saved_r8);
+        uc_reg_read(uc, UC_X86_REG_R9, &saved_r9);
+        uc_reg_read(uc, UC_X86_REG_R10, &saved_r10);
+        uc_reg_read(uc, UC_X86_REG_R11, &saved_r11);
+        uc_reg_read(uc, UC_X86_REG_R12, &saved_r12);
+        uc_reg_read(uc, UC_X86_REG_R13, &saved_r13);
+        uc_reg_read(uc, UC_X86_REG_R14, &saved_r14);
+        uc_reg_read(uc, UC_X86_REG_R15, &saved_r15);
 
-        /* 压入返回地址 (trampoline) */
-        uint64_t new_rsp = saved_rsp - 8;
+        /* 使用独立事件栈，避免覆盖被打断代码的 red zone。 */
+        uint64_t new_rsp = EVT_STACK_TOP - 8;
         uint64_t ret_addr = EVT_RETURN_TRAMP;
         uc_mem_write(uc, new_rsp, &ret_addr, 8);
 
@@ -870,10 +1094,25 @@ void xj380_gui_flush_events(xj380_emu_t *emu)
         /* 运行直到返回 trampoline */
         uc_err ev_err = uc_emu_start(uc, cb, EVT_RETURN_TRAMP, 0, 0);
 
-        /* 恢复状态 (即使执行失败也要尽量恢复) */
+        /* 恢复状态 (即使执行失败也要尽量恢复)。 */
         uc_reg_write(uc, UC_X86_REG_RIP, &saved_rip);
         uc_reg_write(uc, UC_X86_REG_RSP, &saved_rsp);
         uc_reg_write(uc, UC_X86_REG_EFLAGS, &saved_rflags);
+        uc_reg_write(uc, UC_X86_REG_RAX, &saved_rax);
+        uc_reg_write(uc, UC_X86_REG_RBX, &saved_rbx);
+        uc_reg_write(uc, UC_X86_REG_RCX, &saved_rcx);
+        uc_reg_write(uc, UC_X86_REG_RDX, &saved_rdx);
+        uc_reg_write(uc, UC_X86_REG_RSI, &saved_rsi);
+        uc_reg_write(uc, UC_X86_REG_RDI, &saved_rdi);
+        uc_reg_write(uc, UC_X86_REG_RBP, &saved_rbp);
+        uc_reg_write(uc, UC_X86_REG_R8, &saved_r8);
+        uc_reg_write(uc, UC_X86_REG_R9, &saved_r9);
+        uc_reg_write(uc, UC_X86_REG_R10, &saved_r10);
+        uc_reg_write(uc, UC_X86_REG_R11, &saved_r11);
+        uc_reg_write(uc, UC_X86_REG_R12, &saved_r12);
+        uc_reg_write(uc, UC_X86_REG_R13, &saved_r13);
+        uc_reg_write(uc, UC_X86_REG_R14, &saved_r14);
+        uc_reg_write(uc, UC_X86_REG_R15, &saved_r15);
 
         if (ev_err != UC_ERR_OK) {
             fprintf(stderr, "[GUI] 事件注入失败: %s\n", uc_strerror(ev_err));
@@ -886,7 +1125,7 @@ void xj380_gui_render_all(xj380_emu_t *emu)
     (void)emu;
     for (int i = 0; i < g_window_count; i++) {
         gui_window_t *gw = g_windows[i];
-        if (!gw->open) continue;
+        if (!gw->open || !gw->dirty) continue;
         xj380_gui_refresh_window(emu, gw->handle);
     }
 }
@@ -966,26 +1205,76 @@ void xj380_gui_get_pic_size(xj380_emu_t *emu, uint64_t path_ptr,
 void xj380_gui_read_buffer_a(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t buf_ptr)
 {
-    /* RGBA(4字节) → XCOLOR(3字节 RGB, 无Alpha) */
-    gui_window_t *gw = find_window(handle);
-    if (!gw || !buf_ptr) return;
-    for (uint32_t dy = 0; dy < h && (y + dy) < (uint32_t)gw->height; dy++) {
-        for (uint32_t dx = 0; dx < w && (x + dx) < (uint32_t)gw->width; dx++) {
-            uint32_t pixel = gw->fb[(y + dy) * (uint32_t)gw->width + (x + dx)];
-            uint8_t rgb[3];
-            rgb[0] = (uint8_t)((pixel >> 16) & 0xFF); /* R */
-            rgb[1] = (uint8_t)((pixel >>  8) & 0xFF); /* G */
-            rgb[2] = (uint8_t)( pixel        & 0xFF); /* B */
-            uint64_t addr = buf_ptr + (uint64_t)(dy * w + dx) * 3;
-            xj380_mem_write(emu, addr, rgb, 3);
-        }
-    }
+    xj380_gui_read_buffer(emu, handle, x, y, w, h, buf_ptr);
 }
 
 void xj380_gui_write_buffer_a(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t buf_ptr)
 {
-    xj380_gui_write_buffer(emu, handle, x, y, w, h, buf_ptr);
+    gui_window_t *gw = find_window(handle);
+    SDL_Rect      rect;
+
+    if (!buf_ptr || !clip_rect(gw, x, y, w, h, &rect))
+    {
+        return;
+    }
+
+    size_t row_bytes = (size_t)rect.w * 4U;
+    uint8_t *row     = malloc(row_bytes);
+    if (!row)
+    {
+        return;
+    }
+
+    for (int dy = 0; dy < rect.h; dy++)
+    {
+        if (xj380_mem_read(
+                emu,
+                buf_ptr + (uint64_t)dy * (uint64_t)w * 4ULL,
+                row,
+                row_bytes) != 0)
+        {
+            break;
+        }
+
+        uint32_t *dst = gw->fb + (rect.y + dy) * gw->width + rect.x;
+        for (int dx = 0; dx < rect.w; dx++)
+        {
+            uint8_t red   = row[(size_t)dx * 4U + 0U];
+            uint8_t green = row[(size_t)dx * 4U + 1U];
+            uint8_t blue  = row[(size_t)dx * 4U + 2U];
+            uint8_t alpha = row[(size_t)dx * 4U + 3U];
+
+            if (alpha == 255U)
+            {
+                dst[dx] = 0xFF000000U
+                    | ((uint32_t)red << 16)
+                    | ((uint32_t)green << 8)
+                    |  (uint32_t)blue;
+            }
+            else if (alpha != 0U)
+            {
+                uint32_t old   = dst[dx];
+                uint8_t old_r  = (uint8_t)((old >> 16) & 0xFFU);
+                uint8_t old_g  = (uint8_t)((old >>  8) & 0xFFU);
+                uint8_t old_b  = (uint8_t)( old        & 0xFFU);
+                uint8_t out_r  = (uint8_t)(((uint32_t)red * alpha
+                    + (uint32_t)old_r * (255U - alpha)) / 255U);
+                uint8_t out_g  = (uint8_t)(((uint32_t)green * alpha
+                    + (uint32_t)old_g * (255U - alpha)) / 255U);
+                uint8_t out_b  = (uint8_t)(((uint32_t)blue * alpha
+                    + (uint32_t)old_b * (255U - alpha)) / 255U);
+
+                dst[dx] = 0xFF000000U
+                    | ((uint32_t)out_r << 16)
+                    | ((uint32_t)out_g << 8)
+                    |  (uint32_t)out_b;
+            }
+        }
+    }
+
+    mark_dirty(gw, rect.x, rect.y, rect.w, rect.h);
+    free(row);
 }
 
 void xj380_gui_button(xj380_emu_t *emu, uint64_t handle,

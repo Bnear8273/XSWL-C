@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 
 /* ================================================================
  * 常量
@@ -34,6 +35,11 @@
 #define MAX_OPEN_FILES    256
 #define VFS_PATH_MAX      512
 #define MAX_WINDOWS       16
+#define VFS_ALLOC_SIZE    0x1000000ULL
+
+#ifndef PATH_MAX
+#define PATH_MAX          4096
+#endif
 
 /* ================================================================
  * 虚拟文件条目
@@ -56,13 +62,19 @@ struct xj380_emu {
     uc_engine     *uc;
     uint64_t       entry_point;
     uint64_t       brk_addr;
+    uint64_t       heap_map_end;
+    uint64_t       vfs_alloc_addr;
+    uint64_t       vfs_map_end;
 
     /* 错误 */
     char           error[256];
+    char           app_dir[PATH_MAX];
 
     /* 运行状态 */
     bool           running;
     int            exit_code;
+    uint64_t       arg7_value;
+    bool           arg7_valid;
 
     /* VFS */
     vfs_entry_t   *vfs;
@@ -91,55 +103,252 @@ static void h_OPEN(xj380_emu_t *e);
  * 辅助：寄存器读写
  * ================================================================ */
 
-static inline uint64_t r(xj380_emu_t *emu, int reg) {
-    uint64_t v = 0; (void)uc_reg_read(emu->uc, reg, &v); return v;
+static inline uint64_t page_align_up(uint64_t value)
+{
+    return (value + 0xFFFULL) & ~0xFFFULL;
 }
-static inline void w(xj380_emu_t *emu, int reg, uint64_t val) {
+
+static inline uint64_t align_up_u64(uint64_t value, uint64_t align)
+{
+    return (value + align - 1ULL) & ~(align - 1ULL);
+}
+
+static inline uint64_t r(xj380_emu_t *emu, int reg)
+{
+    uint64_t v = 0;
+
+    (void)uc_reg_read(emu->uc, reg, &v);
+    return v;
+}
+
+static inline void w(xj380_emu_t *emu, int reg, uint64_t val)
+{
     (void)uc_reg_write(emu->uc, reg, &val);
+}
+
+static uint64_t current_arg7(xj380_emu_t *emu)
+{
+    if (emu->arg7_valid)
+    {
+        return emu->arg7_value;
+    }
+
+    return 0;
+}
+
+typedef struct
+{
+    uint64_t rdi;
+    uint64_t rsi;
+    uint64_t rdx;
+    uint64_t rcx;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+    uint64_t r11;
+}
+guest_regs_t;
+
+static void save_guest_regs(xj380_emu_t *emu, guest_regs_t *regs)
+{
+    regs->rdi = r(emu, UC_X86_REG_RDI);
+    regs->rsi = r(emu, UC_X86_REG_RSI);
+    regs->rdx = r(emu, UC_X86_REG_RDX);
+    regs->rcx = r(emu, UC_X86_REG_RCX);
+    regs->r8  = r(emu, UC_X86_REG_R8);
+    regs->r9  = r(emu, UC_X86_REG_R9);
+    regs->r10 = r(emu, UC_X86_REG_R10);
+    regs->r11 = r(emu, UC_X86_REG_R11);
+}
+
+static void restore_guest_regs(xj380_emu_t *emu, const guest_regs_t *regs)
+{
+    w(emu, UC_X86_REG_RDI, regs->rdi);
+    w(emu, UC_X86_REG_RSI, regs->rsi);
+    w(emu, UC_X86_REG_RDX, regs->rdx);
+    w(emu, UC_X86_REG_RCX, regs->rcx);
+    w(emu, UC_X86_REG_R8,  regs->r8);
+    w(emu, UC_X86_REG_R9,  regs->r9);
+    w(emu, UC_X86_REG_R10, regs->r10);
+    w(emu, UC_X86_REG_R11, regs->r11);
 }
 
 /* ================================================================
  * 辅助：模拟器内存读写
  * ================================================================ */
 
-int xj380_mem_read_str(xj380_emu_t *emu, uint64_t addr, char *buf, size_t max) {
+int xj380_mem_read_str(xj380_emu_t *emu, uint64_t addr, char *buf, size_t max)
+{
     size_t i = 0;
-    while (i < max - 1) {
+
+    if (!buf || max == 0)
+    {
+        return -1;
+    }
+
+    while (i < max - 1)
+    {
         uint8_t c;
-        if (uc_mem_read(emu->uc, addr + i, &c, 1) != UC_ERR_OK) return -1;
+
+        if (uc_mem_read(emu->uc, addr + i, &c, 1) != UC_ERR_OK)
+        {
+            return -1;
+        }
+
         buf[i] = (char)c;
-        if (c == 0) break;
+        if (c == 0)
+        {
+            break;
+        }
+
         i++;
     }
-    buf[i] = '\0';
+
+    buf[i] = 0;
     return 0;
 }
 
-static int wr_str(xj380_emu_t *emu, uint64_t addr, const char *str) {
+static int wr_str(xj380_emu_t *emu, uint64_t addr, const char *str)
+{
     return (int)uc_mem_write(emu->uc, addr,
-        (const uint8_t*)str, strlen(str) + 1);
+        (const uint8_t *)str, strlen(str) + 1);
 }
 
-static void copy_cstr(char *dst, size_t dst_size, const char *src) {
-    if (dst_size == 0) return;
+static void copy_cstr(char *dst, size_t dst_size, const char *src)
+{
+    if (dst_size == 0)
+    {
+        return;
+    }
+
     snprintf(dst, dst_size, "%s", src ? src : "");
 }
 
-int xj380_mem_read(xj380_emu_t *emu, uint64_t addr, void *dst, size_t len) {
-    return (int)uc_mem_read(emu->uc, addr, (uint8_t*)dst, len);
+int xj380_mem_read(xj380_emu_t *emu, uint64_t addr, void *dst, size_t len)
+{
+    return (int)uc_mem_read(emu->uc, addr, (uint8_t *)dst, len);
 }
 
-int xj380_mem_write(xj380_emu_t *emu, uint64_t addr, const void *src, size_t len) {
-    return (int)uc_mem_write(emu->uc, addr, (const uint8_t*)src, len);
+int xj380_mem_write(xj380_emu_t *emu, uint64_t addr, const void *src, size_t len)
+{
+    return (int)uc_mem_write(emu->uc, addr, (const uint8_t *)src, len);
 }
 
-static uint64_t emu_brk(xj380_emu_t *emu, size_t size) {
-    uint64_t addr = emu->brk_addr;
-    uint64_t pagesz = (size + 0xFFFULL) & ~0xFFFULL;
-    /* 按需映射: 跳过已映射区域 (UC_ERR_MAP) */
-    uc_err err = uc_mem_map(emu->uc, addr, pagesz, UC_PROT_READ | UC_PROT_WRITE);
-    (void)err;  /* 失败通常是已映射, 无害 */
-    emu->brk_addr += pagesz;
+static int map_heap_until(xj380_emu_t *emu, uint64_t end_addr)
+{
+    uint64_t map_end = page_align_up(end_addr);
+
+    if (map_end <= emu->heap_map_end)
+    {
+        return 0;
+    }
+
+    if (map_end < emu->heap_map_end || map_end > XJ380_HEAP_BASE + XJ380_HEAP_SIZE)
+    {
+        return -1;
+    }
+
+    uc_err err = uc_mem_map(
+        emu->uc,
+        emu->heap_map_end,
+        map_end - emu->heap_map_end,
+        UC_PROT_READ | UC_PROT_WRITE);
+    if (err != UC_ERR_OK)
+    {
+        snprintf(emu->error, sizeof(emu->error),
+            "heap map failed at 0x%llx: %s",
+            (unsigned long long)emu->heap_map_end,
+            uc_strerror(err));
+        return -1;
+    }
+
+    emu->heap_map_end = map_end;
+    return 0;
+}
+
+static uint64_t emu_brk(xj380_emu_t *emu, size_t size)
+{
+    uint64_t addr = align_up_u64(emu->brk_addr, 8);
+    uint64_t end  = 0;
+
+    if (size == 0)
+    {
+        return addr;
+    }
+
+    if ((uint64_t)size > UINT64_MAX - addr)
+    {
+        return 0;
+    }
+
+    end = align_up_u64(addr + (uint64_t)size, 8);
+    if (map_heap_until(emu, end) != 0)
+    {
+        return 0;
+    }
+
+    emu->brk_addr = end;
+    return addr;
+}
+
+/* ================================================================
+ * 辅助：模拟器内部分配区
+ * ================================================================ */
+
+static int map_vfs_until(xj380_emu_t *emu, uint64_t end_addr)
+{
+    uint64_t map_end = page_align_up(end_addr);
+
+    if (map_end <= emu->vfs_map_end)
+    {
+        return 0;
+    }
+
+    if (map_end < emu->vfs_map_end || map_end > XJ380_VFS_BASE + VFS_ALLOC_SIZE)
+    {
+        return -1;
+    }
+
+    uc_err err = uc_mem_map(
+        emu->uc,
+        emu->vfs_map_end,
+        map_end - emu->vfs_map_end,
+        UC_PROT_READ | UC_PROT_WRITE);
+    if (err != UC_ERR_OK)
+    {
+        snprintf(emu->error, sizeof(emu->error),
+            "vfs map failed at 0x%llx: %s",
+            (unsigned long long)emu->vfs_map_end,
+            uc_strerror(err));
+        return -1;
+    }
+
+    emu->vfs_map_end = map_end;
+    return 0;
+}
+
+static uint64_t emu_vfs_alloc(xj380_emu_t *emu, size_t size)
+{
+    uint64_t addr = align_up_u64(emu->vfs_alloc_addr, 8);
+    uint64_t end  = 0;
+
+    if (size == 0)
+    {
+        return addr;
+    }
+
+    if ((uint64_t)size > UINT64_MAX - addr)
+    {
+        return 0;
+    }
+
+    end = align_up_u64(addr + (uint64_t)size, 8);
+    if (map_vfs_until(emu, end) != 0)
+    {
+        return 0;
+    }
+
+    emu->vfs_alloc_addr = end;
     return addr;
 }
 
@@ -164,7 +373,52 @@ static int vfs_ensure(xj380_emu_t *emu) {
     return 0;
 }
 
-static int vfs_import_host(xj380_emu_t *emu, const char *vpath, const char *hpath) {
+static int try_host_path(char *host_path, size_t host_path_size,
+    const char *prefix, const char *rel_path)
+{
+    int written = 0;
+
+    if (!prefix || prefix[0] == 0 || strcmp(prefix, ".") == 0)
+    {
+        written = snprintf(host_path, host_path_size, "%s", rel_path);
+    }
+    else
+    {
+        written = snprintf(host_path, host_path_size, "%s/%s", prefix, rel_path);
+    }
+
+    if (written < 0 || (size_t)written >= host_path_size)
+    {
+        return -1;
+    }
+
+    return access(host_path, R_OK) == 0 ? 0 : -1;
+}
+
+static int vfs_resolve_host_path(xj380_emu_t *emu, const char *vpath,
+    char *host_path, size_t host_path_size)
+{
+    const char *rel_path = (vpath && *vpath == '/') ? vpath + 1 : vpath;
+
+    if (!rel_path || !host_path || host_path_size == 0 || strstr(rel_path, ".."))
+    {
+        return -1;
+    }
+
+    if (try_host_path(host_path, host_path_size, ".", rel_path) == 0
+        || try_host_path(host_path, host_path_size, emu->app_dir, rel_path) == 0
+        || try_host_path(host_path, host_path_size, "..", rel_path) == 0
+        || try_host_path(host_path, host_path_size, "../XJ380 System", rel_path) == 0
+        || try_host_path(host_path, host_path_size, "XJ380 System", rel_path) == 0)
+    {
+        return 0;
+    }
+
+    return -1;
+}
+
+static int vfs_import_host(xj380_emu_t *emu, const char *vpath, const char *hpath)
+{
     if (vfs_ensure(emu) != 0) return -1;
     FILE *fp = fopen(hpath, "rb");
     if (!fp) return -1;
@@ -191,6 +445,8 @@ static int vfs_import_host(xj380_emu_t *emu, const char *vpath, const char *hpat
     emu->vfs[idx].data   = d;
     emu->vfs[idx].size   = sz;
     emu->vfs[idx].is_dir = false;
+    emu->vfs[idx].emu_addr   = 0;
+    emu->vfs[idx].emu_cached = false;
     return idx;
 }
 
@@ -202,6 +458,8 @@ static int vfs_create(xj380_emu_t *emu, const char *path, bool is_dir) {
     emu->vfs[idx].data   = NULL;
     emu->vfs[idx].size   = 0;
     emu->vfs[idx].is_dir = is_dir;
+    emu->vfs[idx].emu_addr   = 0;
+    emu->vfs[idx].emu_cached = false;
     return idx;
 }
 
@@ -240,11 +498,30 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
 
     emu->entry_point = eh.e_entry ? eh.e_entry : XJ380_TEXT_BASE;
 
+    const char *slash = strrchr(path, '/');
+    if (slash)
+    {
+        size_t dir_len = (size_t)(slash - path);
+        if (dir_len >= sizeof(emu->app_dir))
+        {
+            dir_len = sizeof(emu->app_dir) - 1U;
+        }
+        memcpy(emu->app_dir, path, dir_len);
+        emu->app_dir[dir_len] = 0;
+    }
+    else
+    {
+        copy_cstr(emu->app_dir, sizeof(emu->app_dir), ".");
+    }
+
     /* 映射固定区域（堆改为按需映射, 不再预分配 16MB） */
     uc_mem_map(emu->uc, XJ380_STACK_BASE, XJ380_STACK_SIZE, UC_PROT_READ | UC_PROT_WRITE);
     uc_mem_map(emu->uc, XJ380_TRAMP_BASE, XJ380_TRAMP_SIZE, UC_PROT_READ | UC_PROT_EXEC);
     uc_mem_map(emu->uc, 0xFFFFF000, 0x1000, UC_PROT_READ | UC_PROT_EXEC); /* 事件回调返回 */
-    emu->brk_addr = XJ380_HEAP_BASE;
+    emu->brk_addr     = XJ380_HEAP_BASE;
+    emu->heap_map_end = XJ380_HEAP_BASE;
+    emu->vfs_alloc_addr = XJ380_VFS_BASE;
+    emu->vfs_map_end    = XJ380_VFS_BASE;
 
     /* 先读取所有程序头（不要在处理段数据时 fseek 破坏文件指针） */
     Elf64_Phdr *phdrs = calloc((size_t)eh.e_phnum, sizeof(Elf64_Phdr));
@@ -360,7 +637,10 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
     fclose(fp);
 
     if (max_vaddr > emu->brk_addr)
-        emu->brk_addr = (max_vaddr + 0xFFF) & ~0xFFFULL;
+    {
+        emu->brk_addr     = page_align_up(max_vaddr);
+        emu->heap_map_end = emu->brk_addr;
+    }
 
     /* 写入 xapi trampolines
      * 每条占 16 字节:
@@ -628,21 +908,26 @@ static void xj380_syscall_hook(uc_engine *uc, uint64_t addr, uint32_t size, void
     (void)uc;
     (void)size;
     xj380_emu_t *emu = (xj380_emu_t*)user_data;
+    guest_regs_t saved_regs;
+    save_guest_regs(emu, &saved_regs);
+
     uint64_t xj380_no = r(emu, UC_X86_REG_RAX);
+#ifdef DEBUG_TRACE
     fprintf(stderr, "  [HOOK] syscall @ 0x%llx RAX=0x%llx (%llu)\n",
             (unsigned long long)addr, (unsigned long long)xj380_no,
             (unsigned long long)xj380_no);
+#endif
 
     /* Linux syscall ABI: arg4 在 R10, handler 期望在 RCX */
     uint64_t r10_val = r(emu, UC_X86_REG_R10);
     w(emu, UC_X86_REG_RCX, r10_val);
 
-    /* 7-arg 函数兼容: syscall 路径 arg7 在 R9, 压栈统一两路径 */
-    uint64_t r9_val = r(emu, UC_X86_REG_R9);
-    uint64_t sp = r(emu, UC_X86_REG_RSP);
-    sp -= 8;
-    w(emu, UC_X86_REG_RSP, sp);
-    xj380_mem_write(emu, sp, &r9_val, 8);
+    /*
+     * enter_syscall 已经把原始第 7 参数暂存在 R9。
+     * 这里不能改 guest RSP, 否则会破坏真实调用者的栈帧。
+     */
+    emu->arg7_value = r(emu, UC_X86_REG_R9);
+    emu->arg7_valid = true;
 
     /* 特殊 syscall: SYS_BRK (12) */
     if (xj380_no == 12) {
@@ -666,12 +951,15 @@ static void xj380_syscall_hook(uc_engine *uc, uint64_t addr, uint32_t size, void
         }
     }
 
-    /* 弹出之前压入的 R9 (7-arg 兼容) */
-    sp = r(emu, UC_X86_REG_RSP);
-    sp += 8;
-    w(emu, UC_X86_REG_RSP, sp);
+    uint64_t result = r(emu, UC_X86_REG_RAX);
 
-    /* 跳过 syscall 指令 (2 字节), 返回 enter_syscall 的收尾代码 */
+    emu->arg7_value = 0;
+    emu->arg7_valid = false;
+
+    restore_guest_regs(emu, &saved_regs);
+    w(emu, UC_X86_REG_RAX, result);
+
+    /* 跳过 syscall 指令 (2 字节), 返回 enter_syscall 的收尾代码。 */
     w(emu, UC_X86_REG_RIP, addr + 2);
 }
 
@@ -714,16 +1002,14 @@ static void tramp_hook(uc_engine *uc, uint64_t addr, uint32_t size, void *user_d
     /* 7-arg 兼容: SysV 调用下第 7 参数在返回地址之后。 */
     uint64_t my_sp = r(emu, UC_X86_REG_RSP);
     uint64_t stack_arg7 = 0;
-    (void)uc_mem_read(uc, my_sp + 8, (uint8_t*)&stack_arg7, 8);
-    my_sp -= 8;
-    w(emu, UC_X86_REG_RSP, my_sp);
-    xj380_mem_write(emu, my_sp, &stack_arg7, 8);
+    (void)uc_mem_read(uc, my_sp + 8, (uint8_t *)&stack_arg7, 8);
+    emu->arg7_value = stack_arg7;
+    emu->arg7_valid = true;
 
     dispatch_xapi(emu, syscall_no);
 
-    /* 弹出临时压入的第 7 参数, 露出返回地址 */
-    my_sp += 8;
-    w(emu, UC_X86_REG_RSP, my_sp);
+    emu->arg7_value = 0;
+    emu->arg7_valid = false;
 
     /* 模拟 ret: 从栈顶弹返回地址 */
     uint64_t ret_addr = 0;
@@ -738,8 +1024,64 @@ static void on_syscall(uc_engine *uc, uint32_t intno, void *user_data)
     (void)uc;
     (void)intno;
     (void)user_data;
-    /* 备用：如果 syscall 指令真的触发了 */
     fprintf(stderr, "  [SYSCALL FALLBACK]\n");
+}
+
+static bool invalid_mem_hook(uc_engine *uc, uc_mem_type type, uint64_t address,
+    int size, int64_t value, void *user_data)
+{
+    xj380_emu_t *emu = (xj380_emu_t *)user_data;
+    uint64_t     rip = 0;
+    uint64_t     rax = 0;
+    uint64_t     rcx = 0;
+    uint64_t     rdx = 0;
+    uint64_t     rdi = 0;
+    uint64_t     rsi = 0;
+    uint64_t     rsp = 0;
+    uint64_t     rbp = 0;
+    const char  *kind = "UNKNOWN";
+
+    (void)value;
+    (void)uc_reg_read(uc, UC_X86_REG_RIP, &rip);
+    (void)uc_reg_read(uc, UC_X86_REG_RAX, &rax);
+    (void)uc_reg_read(uc, UC_X86_REG_RCX, &rcx);
+    (void)uc_reg_read(uc, UC_X86_REG_RDX, &rdx);
+    (void)uc_reg_read(uc, UC_X86_REG_RDI, &rdi);
+    (void)uc_reg_read(uc, UC_X86_REG_RSI, &rsi);
+    (void)uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+    (void)uc_reg_read(uc, UC_X86_REG_RBP, &rbp);
+
+    if (type == UC_MEM_READ_UNMAPPED)
+    {
+        kind = "READ_UNMAPPED";
+    }
+    else if (type == UC_MEM_WRITE_UNMAPPED)
+    {
+        kind = "WRITE_UNMAPPED";
+    }
+    else if (type == UC_MEM_FETCH_UNMAPPED)
+    {
+        kind = "FETCH_UNMAPPED";
+    }
+
+    fprintf(stderr,
+        "[xj380] invalid memory: %s addr=0x%llx size=%d rip=0x%llx "
+        "rax=0x%llx rcx=0x%llx rdx=0x%llx rdi=0x%llx rsi=0x%llx "
+        "rsp=0x%llx rbp=0x%llx brk=0x%llx map_end=0x%llx\n",
+        kind,
+        (unsigned long long)address,
+        size,
+        (unsigned long long)rip,
+        (unsigned long long)rax,
+        (unsigned long long)rcx,
+        (unsigned long long)rdx,
+        (unsigned long long)rdi,
+        (unsigned long long)rsi,
+        (unsigned long long)rsp,
+        (unsigned long long)rbp,
+        (unsigned long long)emu->brk_addr,
+        (unsigned long long)emu->heap_map_end);
+    return false;
 }
 
 /* ================================================================
@@ -796,41 +1138,81 @@ static void h_OUTPUTSERIAL(xj380_emu_t *e) {
     uint64_t a = r(e, UC_X86_REG_RDI); char b[4096];
     if (xj380_mem_read_str(e, a, b, sizeof(b)) == 0) fprintf(stderr, "[serial] %s\n", b);
 }
-static void h_OPENFILE(xj380_emu_t *e) {
-    uint64_t a = r(e, UC_X86_REG_RDI); char p[512];
-    if (xj380_mem_read_str(e, a, p, sizeof(p)) != 0) { w(e, UC_X86_REG_RAX, 0); return; }
+static void h_OPENFILE(xj380_emu_t *e)
+{
+    uint64_t a = r(e, UC_X86_REG_RDI);
+    char     p[512];
+
+    w(e, UC_X86_REG_RAX, 0);
+    if (xj380_mem_read_str(e, a, p, sizeof(p)) != 0)
+    {
+        return;
+    }
+
     printf("[xj380] OpenFile: %s\n", p);
+
     int idx = vfs_find(e, p);
-    if (idx < 0) {
-        const char *hp = (*p == '/') ? p + 1 : p;
-        idx = vfs_import_host(e, p, hp);
-        if (idx < 0) {
-            /* /system/ 路径是系统文件: 创建空占位防止程序死循环 */
-            if (strncmp(p, "/system/", 8) == 0) {
+    if (idx < 0)
+    {
+        char hp[PATH_MAX];
+
+        idx = (vfs_resolve_host_path(e, p, hp, sizeof(hp)) == 0)
+            ? vfs_import_host(e, p, hp)
+            : -1;
+        if (idx < 0)
+        {
+            if (strncmp(p, "/system/", 8) == 0)
+            {
                 idx = vfs_create(e, p, false);
-                if (idx < 0) { w(e, UC_X86_REG_RAX, 0); return; }
-            } else {
+            }
+            else
+            {
                 fprintf(stderr, "[xj380] OpenFile 失败: '%s' 不存在\n", p);
-                w(e, UC_X86_REG_RAX, 0);
                 return;
             }
         }
+
+        if (idx < 0)
+        {
+            return;
+        }
     }
+
     vfs_entry_t *ent = &e->vfs[idx];
-    uint64_t xf = emu_brk(e, 16);
-    uint64_t len = ent->size, buf = 0;
-    if (ent->size > 0 && ent->data) {
-        if (!ent->emu_cached) {
-            buf = emu_brk(e, ent->size);
-            xj380_mem_write(e, buf, ent->data, ent->size);
+    uint64_t     xf  = emu_vfs_alloc(e, 16);
+    uint64_t     len = (uint64_t)ent->size;
+    uint64_t     buf = 0;
+
+    if (!xf)
+    {
+        return;
+    }
+
+    if (ent->size > 0 && ent->data)
+    {
+        if (!ent->emu_cached)
+        {
+            buf = emu_vfs_alloc(e, ent->size);
+            if (!buf || xj380_mem_write(e, buf, ent->data, ent->size) != 0)
+            {
+                return;
+            }
+
             ent->emu_addr   = buf;
             ent->emu_cached = true;
-        } else {
+        }
+        else
+        {
             buf = ent->emu_addr;
         }
     }
-    xj380_mem_write(e, xf,     &len, 8);
-    xj380_mem_write(e, xf + 8, &buf, 8);
+
+    if (xj380_mem_write(e, xf, &len, 8) != 0
+        || xj380_mem_write(e, xf + 8, &buf, 8) != 0)
+    {
+        return;
+    }
+
     w(e, UC_X86_REG_RAX, xf);
 }
 static void h_CLOSEFILE(xj380_emu_t *e) {
@@ -1062,7 +1444,7 @@ static void h_SLEEP(xj380_emu_t *e) {
             break;
         }
         if (i % 16 == 0) xj380_gui_render_all(e);  /* ≈60fps */
-        /* 注: flush_events 不能在 uc_emu_start 内调用 (嵌套) — 由 xj380_run 外层分发 */
+        xj380_gui_flush_events(e);
     }
 #else
     usleep((unsigned int)(ms * 1000));
@@ -1088,26 +1470,51 @@ static void h_SETMSGPRCOR(xj380_emu_t *e) {
     (void)handle; (void)func;
 #endif
 }
-static void h_FLUSHTIME(xj380_emu_t *e) { (void)e; }
+static void h_FLUSHTIME(xj380_emu_t *e) {
+#ifdef XJ380_GUI
+    xj380_gui_poll_events(e);
+    xj380_gui_flush_events(e);
+    xj380_gui_render_all(e);
+#else
+    (void)e;
+#endif
+}
 static void h_ALLOCATEMEMORY(xj380_emu_t *e) {
     w(e, UC_X86_REG_RAX, emu_brk(e, (size_t)r(e, UC_X86_REG_RDI)));
 }
 static void h_FREEMEMORY(xj380_emu_t *e) { (void)e; /* 无法部分 unmap */ }
 /* SYS_BRK handler: Linux brk() 语义 */
-static void h_SYSBRK(xj380_emu_t *e) {
-    uint64_t new_brk = r(e, UC_X86_REG_RDI);  /* arg1 = new brk address */
-    if (new_brk == 0) {
-        /* brk(0): 返回当前 brk */
+static void h_SYSBRK(xj380_emu_t *e)
+{
+    uint64_t new_brk = r(e, UC_X86_REG_RDI);
+
+    if (new_brk == 0)
+    {
         w(e, UC_X86_REG_RAX, e->brk_addr);
         return;
     }
-    if (new_brk > e->brk_addr) {
-        uint64_t need = (new_brk - e->brk_addr + 0xFFFULL) & ~0xFFFULL;
-        (void)uc_mem_map(e->uc, e->brk_addr, need, UC_PROT_READ | UC_PROT_WRITE);
-        e->brk_addr = new_brk;
-    } else if (new_brk < e->brk_addr && new_brk >= XJ380_HEAP_BASE) {
+
+    if (new_brk > XJ380_HEAP_BASE + XJ380_HEAP_SIZE)
+    {
+        w(e, UC_X86_REG_RAX, e->brk_addr);
+        return;
+    }
+
+    if (new_brk > e->brk_addr)
+    {
+        if (map_heap_until(e, new_brk) != 0)
+        {
+            w(e, UC_X86_REG_RAX, e->brk_addr);
+            return;
+        }
+
         e->brk_addr = new_brk;
     }
+    else if (new_brk >= XJ380_HEAP_BASE)
+    {
+        e->brk_addr = new_brk;
+    }
+
     w(e, UC_X86_REG_RAX, e->brk_addr);
 }
 
@@ -1148,8 +1555,10 @@ static void h_OPEN(xj380_emu_t *e) {
     xj380_mem_read_str(e, path, p, sizeof(p));
     int idx = vfs_find(e, p);
     if (idx < 0) {
-        const char *hp = (*p == '/') ? p + 1 : p;
-        idx = vfs_import_host(e, p, hp);
+        char hp[PATH_MAX];
+        idx = (vfs_resolve_host_path(e, p, hp, sizeof(hp)) == 0)
+            ? vfs_import_host(e, p, hp)
+            : -1;
         if (idx < 0) {
             fprintf(stderr, "[xj380] Open 失败: '%s' 不存在\n", p);
             w(e, UC_X86_REG_RAX, UINT64_MAX);
@@ -1159,16 +1568,56 @@ static void h_OPEN(xj380_emu_t *e) {
     w(e, UC_X86_REG_RAX, (uint64_t)(idx + 3));
 }
 
-static void h_MAPMEMORY(xj380_emu_t *e) {
-    uint64_t a = r(e, UC_X86_REG_RDI), sz = r(e, UC_X86_REG_RSI);
+static void h_MAPMEMORY(xj380_emu_t *e)
+{
+    uint64_t a  = r(e, UC_X86_REG_RDI);
+    uint64_t sz = r(e, UC_X86_REG_RSI);
     uint32_t fl = (uint32_t)r(e, UC_X86_REG_RDX);
-    int prot = 0;
-    if (fl & 1) prot |= UC_PROT_READ;
-    if (fl & 2) prot |= UC_PROT_WRITE;
-    if (!(fl & 64)) prot |= UC_PROT_EXEC;
-    sz = (sz + 0xFFF) & ~0xFFFULL;
-    if (!a) { a = e->brk_addr; e->brk_addr += sz; }
-    (void)uc_mem_map(e->uc, a, sz, (uint32_t)prot);
+    int      prot = 0;
+
+    if (sz == 0 || sz > UINT64_MAX - 0xFFFULL)
+    {
+        w(e, UC_X86_REG_RAX, 0);
+        return;
+    }
+
+    if (fl & 1U)
+    {
+        prot |= UC_PROT_READ;
+    }
+    if (fl & 2U)
+    {
+        prot |= UC_PROT_WRITE;
+    }
+    if (!(fl & 64U))
+    {
+        prot |= UC_PROT_EXEC;
+    }
+    if (!prot)
+    {
+        prot = UC_PROT_READ;
+    }
+
+    sz = page_align_up(sz);
+    if (!a)
+    {
+        a = emu_brk(e, (size_t)sz);
+        w(e, UC_X86_REG_RAX, a);
+        return;
+    }
+
+    if ((a & 0xFFFULL) != 0)
+    {
+        w(e, UC_X86_REG_RAX, 0);
+        return;
+    }
+
+    if (uc_mem_map(e->uc, a, sz, (uint32_t)prot) != UC_ERR_OK)
+    {
+        w(e, UC_X86_REG_RAX, 0);
+        return;
+    }
+
     w(e, UC_X86_REG_RAX, a);
 }
 
@@ -1204,9 +1653,7 @@ static void gh_DRAWLINE(xj380_emu_t *e) {
         (uint32_t)r(e,UC_X86_REG_R8), (uint32_t)r(e,UC_X86_REG_R9));
 }
 static void gh_DRAWRECT(xj380_emu_t *e) {
-    uint64_t rsp = r(e, UC_X86_REG_RSP);
-    uint64_t fill = 0;
-    xj380_mem_read(e, rsp, &fill, 8);
+    uint64_t fill = current_arg7(e);
     xj380_gui_draw_rect(e, GETH, (uint32_t)r(e,UC_X86_REG_RSI),
         (uint32_t)r(e,UC_X86_REG_RDX), (uint32_t)r(e,UC_X86_REG_RCX),
         (uint32_t)r(e,UC_X86_REG_R8), (uint32_t)r(e,UC_X86_REG_R9), (int)fill);
@@ -1217,10 +1664,7 @@ static void gh_DRAWTEXT(xj380_emu_t *e) {
         (uint32_t)r(e,UC_X86_REG_R8), (uint32_t)r(e,UC_X86_REG_R9));
 }
 static void gh_DRAWTEXTL(xj380_emu_t *e) {
-    /* 7 参数: wrapper 入口统一把第 7 参数暂存在 [RSP+0]。 */
-    uint64_t rsp = r(e, UC_X86_REG_RSP);
-    uint64_t width_ptr = 0;
-    xj380_mem_read(e, rsp, &width_ptr, 8);
+    uint64_t width_ptr = current_arg7(e);
     xj380_gui_draw_text_l(e, GETH, (uint32_t)r(e,UC_X86_REG_RSI),
         (uint32_t)r(e,UC_X86_REG_RDX), r(e,UC_X86_REG_RCX),
         (uint32_t)r(e,UC_X86_REG_R8), (uint32_t)r(e,UC_X86_REG_R9), width_ptr);
@@ -1429,6 +1873,13 @@ xj380_emu_t* xj380_create(void)
     (void)uc_hook_add(emu->uc, &h_sys, UC_HOOK_INTR,
                       (void*)on_syscall, emu,
                       UC_X86_INS_SYSCALL, (uint64_t)-1, (uint64_t)0);
+
+    uc_hook h_invalid;
+    (void)uc_hook_add(emu->uc, &h_invalid,
+                      UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED
+                      | UC_HOOK_MEM_FETCH_UNMAPPED,
+                      (void*)invalid_mem_hook, emu,
+                      (uint64_t)1, (uint64_t)0);
     _Pragma("GCC diagnostic pop")
 
 #ifdef DEBUG_TRACE
@@ -1456,25 +1907,25 @@ void xj380_destroy(xj380_emu_t *emu)
 
 int xj380_run(xj380_emu_t *emu, int host_argc, char **host_argv)
 {
-    /* 设置模拟程序的 argc/argv/envp */
+    /* 设置模拟程序的 argc/argv/envp。字符串和指针表分开，避免长路径覆盖 argv。 */
     uint64_t rsp = r(emu, UC_X86_REG_RSP);
-    (void)host_argc; (void)host_argv;
+    (void)host_argc;
 
-    /* 在栈上分配 argv[1] 和 envp[1] (各 8 字节 + NULL) */
-    rsp -= 32;  /* 留空间 */
-    w(emu, UC_X86_REG_RSP, rsp);
+    const char *prog_name = (host_argv && host_argv[0]) ? host_argv[0] : "xswl-app";
+    size_t      prog_len  = strlen(prog_name) + 1U;
+    uint64_t    zero      = 0;
 
-    /* argv[0] = 程序路径 (用于资源定位) */
-    const char *prog_name = host_argv ? host_argv[0] : "xswl-app";
-    uint64_t argv0_str = rsp + 16;
-    xj380_mem_write(emu, argv0_str, prog_name, strlen(prog_name) + 1);
+    rsp -= align_up_u64((uint64_t)prog_len, 16);
+    uint64_t argv0_str = rsp;
+    xj380_mem_write(emu, argv0_str, prog_name, prog_len);
+
+    rsp -= 32;
+    rsp &= ~0xFULL;
     uint64_t argv_array = rsp;
-    xj380_mem_write(emu, argv_array, &argv0_str, 8);     /* argv[0] */
-    uint64_t zero = 0;
-    xj380_mem_write(emu, argv_array + 8, &zero, 8);        /* argv[1] = NULL */
-
-    /* envp[0] = NULL */
     uint64_t envp_array = argv_array + 16;
+
+    xj380_mem_write(emu, argv_array, &argv0_str, 8);
+    xj380_mem_write(emu, argv_array + 8, &zero, 8);
     xj380_mem_write(emu, envp_array, &zero, 8);
 
     w(emu, UC_X86_REG_RDI, 1);            /* argc = 1 */
@@ -1496,7 +1947,6 @@ int xj380_run(xj380_emu_t *emu, int host_argc, char **host_argv)
             int ev = xj380_gui_poll_events(emu);
             if (ev == 2) { emu->running = false; break; }
             xj380_gui_render_all(emu);
-            xj380_gui_flush_events(emu);
         } else {
             snprintf(emu->error, sizeof(emu->error), "uc_emu_start: %s", uc_strerror(err));
             return -1;
