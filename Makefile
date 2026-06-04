@@ -9,6 +9,7 @@ INC       = -I/usr/include -I/usr/include/SDL2
 LIBS_TUI  = -lunicorn -lm
 LIBS_GUI  = -lunicorn -lSDL2 -lSDL2_image -lm
 TEST_ELF  = test_file.elf
+GUI_EVENT_TEST_ELF = test_gui_events.elf
 
 SRC_TUI   = main.c xj380_emu.c
 SRC_GUI   = main.c xj380_emu.c xj380_gui.c
@@ -66,13 +67,19 @@ release:
 $(TEST_ELF): test_file.S
 	gcc -m64 -nostdlib -static -no-pie -o $@ $< -Wl,-Ttext=0x200000
 
-.PHONY: test test-real
+$(GUI_EVENT_TEST_ELF): test_gui_events.S
+	gcc -m64 -nostdlib -static -no-pie -o $@ $< -Wl,-Ttext=0x200000
+
+.PHONY: test test-gui-events test-real
 test: $(TARGET) $(TEST_ELF)
 	./$(TARGET) $(TEST_ELF)
+
+test-gui-events: gui $(GUI_EVENT_TEST_ELF)
+	SDL_VIDEODRIVER=dummy XSWL_TEST_GUI_EVENTS=1 ./$(TARGET) $(GUI_EVENT_TEST_ELF)
 
 test-real: $(TARGET)
 	./$(TARGET) /home/bnear8273/Develop/Projects/XSWL/main.epf
 
 .PHONY: clean
 clean:
-	rm -f $(TARGET) $(TEST_ELF) *.o *.dev.o *.rel.o
+	rm -f $(TARGET) $(TEST_ELF) $(GUI_EVENT_TEST_ELF) *.o *.dev.o *.rel.o

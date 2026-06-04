@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <limits.h>
 
 /* ================================================================
  * GUI 窗口结构
@@ -91,6 +92,8 @@ static gui_window_t *g_windows[MAX_GUI_WINDOWS];
 static int            g_window_count;
 static uint64_t       g_next_handle = 1;
 static bool           g_sdl_initialized;
+static bool           g_test_events_enabled;
+static bool           g_test_events_pushed;
 
 /* ---- TTF 字体缓存 ---- */
 #define MAX_FONTS 8
@@ -113,11 +116,17 @@ static void copy_cstr(char *dst, size_t dst_size, const char *src)
 
 static cached_font_t* find_font(const char *path)
 {
-    /* 找已缓存的字体, 没找到则返回最近加载的 */
     for (int i = 0; i < g_font_count; i++)
-        if (strcmp(g_fonts[i].path, path) == 0) return &g_fonts[i];
+    {
+        if (strcmp(g_fonts[i].path, path) == 0)
+        {
+            return &g_fonts[i];
+        }
+    }
+
     return g_font_count > 0 ? &g_fonts[0] : NULL;
 }
+
 
 
 /* ================================================================
@@ -133,6 +142,9 @@ int xj380_gui_init(void)
     }
 
     IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG);
+    g_test_events_enabled = getenv("XSWL_TEST_GUI_EVENTS") != NULL;
+    g_test_events_pushed = false;
+    SDL_StartTextInput();
 
     g_sdl_initialized = true;
     printf("[GUI] SDL2 初始化完成\n");
@@ -152,6 +164,7 @@ void xj380_gui_cleanup(void)
     g_window_count = 0;
 
     if (g_sdl_initialized) {
+        SDL_StopTextInput();
         IMG_Quit();
         SDL_Quit();
         g_sdl_initialized = false;
@@ -233,6 +246,10 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!rend)
     {
+        rend = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    }
+    if (!rend)
+    {
         fprintf(stderr, "[GUI] SDL_CreateRenderer 失败: %s\n", SDL_GetError());
         SDL_DestroyWindow(win);
         uint64_t zero = 0;
@@ -241,7 +258,7 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
     }
 
     SDL_Texture *tex = SDL_CreateTexture(rend,
-        SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING,
+        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
         (int)width, (int)height);
     if (!tex)
     {
@@ -371,6 +388,69 @@ static bool clip_rect(gui_window_t *gw, uint32_t x, uint32_t y,
     return true;
 }
 
+static uint32_t rgba_to_argb(uint32_t rgba)
+{
+    return ((rgba & 0x000000FFU) << 24) | ((rgba & 0xFFFFFF00U) >> 8);
+}
+
+static uint32_t argb_to_rgba(uint32_t argb)
+{
+    return ((argb & 0x00FFFFFFU) << 8) | ((argb & 0xFF000000U) >> 24);
+}
+
+static bool utf8_next_codepoint(const char *text, const char *p, int *codepoint, int *len)
+{
+    size_t remaining = strlen(p);
+    unsigned char c0 = (unsigned char)p[0];
+
+    (void)text;
+    if (!codepoint || !len || remaining == 0)
+    {
+        return false;
+    }
+
+    if ((c0 & 0x80U) == 0)
+    {
+        *codepoint = c0;
+        *len = 1;
+        return true;
+    }
+
+    if ((c0 & 0xE0U) == 0xC0U)
+    {
+        if (remaining < 2 || (((unsigned char)p[1] & 0xC0U) != 0x80U)) return false;
+        *codepoint = ((int)(c0 & 0x1FU) << 6) | (int)((unsigned char)p[1] & 0x3FU);
+        *len = 2;
+        return true;
+    }
+
+    if ((c0 & 0xF0U) == 0xE0U)
+    {
+        if (remaining < 3 || (((unsigned char)p[1] & 0xC0U) != 0x80U)
+            || (((unsigned char)p[2] & 0xC0U) != 0x80U)) return false;
+        *codepoint = ((int)(c0 & 0x0FU) << 12)
+                   | ((int)((unsigned char)p[1] & 0x3FU) << 6)
+                   |  (int)((unsigned char)p[2] & 0x3FU);
+        *len = 3;
+        return true;
+    }
+
+    if ((c0 & 0xF8U) == 0xF0U)
+    {
+        if (remaining < 4 || (((unsigned char)p[1] & 0xC0U) != 0x80U)
+            || (((unsigned char)p[2] & 0xC0U) != 0x80U)
+            || (((unsigned char)p[3] & 0xC0U) != 0x80U)) return false;
+        *codepoint = ((int)(c0 & 0x07U) << 18)
+                   | ((int)((unsigned char)p[1] & 0x3FU) << 12)
+                   | ((int)((unsigned char)p[2] & 0x3FU) << 6)
+                   |  (int)((unsigned char)p[3] & 0x3FU);
+        *len = 4;
+        return true;
+    }
+
+    return false;
+}
+
 static void mark_dirty(gui_window_t *gw, int x, int y, int w, int h)
 {
     SDL_Rect clipped;
@@ -390,7 +470,7 @@ static void mark_dirty(gui_window_t *gw, int x, int y, int w, int h)
     SDL_UnionRect(&gw->dirty_rect, &clipped, &gw->dirty_rect);
 }
 
-static void set_pixel(gui_window_t *gw, int x, int y, uint32_t rgba)
+static void set_pixel_raw(gui_window_t *gw, int x, int y, uint32_t rgba)
 {
     if (x < 0 || y < 0 || x >= gw->width || y >= gw->height)
     {
@@ -398,6 +478,11 @@ static void set_pixel(gui_window_t *gw, int x, int y, uint32_t rgba)
     }
 
     gw->fb[y * gw->width + x] = rgba;
+}
+
+static void set_pixel(gui_window_t *gw, int x, int y, uint32_t rgba)
+{
+    set_pixel_raw(gw, x, y, rgba);
     mark_dirty(gw, x, y, 1, 1);
 }
 
@@ -406,17 +491,21 @@ void xj380_gui_draw_point(xj380_emu_t *emu, uint64_t handle,
 {
     (void)emu;
     gui_window_t *gw = find_window(handle);
-    if (gw) set_pixel(gw, (int)x, (int)y, rgba);
+    if (gw) set_pixel(gw, (int)x, (int)y, rgba_to_argb(rgba));
 }
 
 void xj380_gui_draw_line(xj380_emu_t *emu, uint64_t handle,
     uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t rgba)
 {
+    rgba = rgba_to_argb(rgba);
     (void)emu;
     gui_window_t *gw = find_window(handle);
-    if (!gw) return;
 
-    /* Bresenham 画线 */
+    if (!gw)
+    {
+        return;
+    }
+
     int dx  = abs((int)x2 - (int)x1);
     int dy  = -abs((int)y2 - (int)y1);
     int sx  = x1 < x2 ? 1 : -1;
@@ -425,47 +514,95 @@ void xj380_gui_draw_line(xj380_emu_t *emu, uint64_t handle,
     int cx  = (int)x1;
     int cy  = (int)y1;
 
-    for (;;) {
-        set_pixel(gw, cx, cy, rgba);
-        if (cx == (int)x2 && cy == (int)y2) break;
+    for (;;)
+    {
+        set_pixel_raw(gw, cx, cy, rgba);
+        if (cx == (int)x2 && cy == (int)y2)
+        {
+            break;
+        }
+
         int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; cx += sx; }
-        if (e2 <= dx) { err += dx; cy += sy; }
+        if (e2 >= dy)
+        {
+            err += dy;
+            cx += sx;
+        }
+        if (e2 <= dx)
+        {
+            err += dx;
+            cy += sy;
+        }
     }
+
+    uint32_t lx = x1 < x2 ? x1 : x2;
+    uint32_t rx = x1 > x2 ? x1 : x2;
+    uint32_t ty = y1 < y2 ? y1 : y2;
+    uint32_t by = y1 > y2 ? y1 : y2;
+    mark_dirty(gw, (int)lx, (int)ty, (int)(rx - lx + 1U), (int)(by - ty + 1U));
 }
 
 void xj380_gui_draw_rect(xj380_emu_t *emu, uint64_t handle,
     uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2,
     uint32_t rgba, int fill)
 {
+    rgba = rgba_to_argb(rgba);
     (void)emu;
     gui_window_t *gw = find_window(handle);
-    if (!gw) return;
+    SDL_Rect      rect;
 
-    int lx = (int)(x1 < x2 ? x1 : x2);
-    int rx = (int)(x1 > x2 ? x1 : x2);
-    int ty = (int)(y1 < y2 ? y1 : y2);
-    int by = (int)(y1 > y2 ? y1 : y2);
+    if (!gw)
+    {
+        return;
+    }
 
-    if (fill) {
-        for (int y = ty; y <= by; y++)
-            for (int x = lx; x <= rx; x++)
-                set_pixel(gw, x, y, rgba);
-    } else {
-        for (int x = lx; x <= rx; x++) {
-            set_pixel(gw, x, ty, rgba);
-            set_pixel(gw, x, by, rgba);
-        }
-        for (int y = ty; y <= by; y++) {
-            set_pixel(gw, lx, y, rgba);
-            set_pixel(gw, rx, y, rgba);
+    uint32_t lx = x1 < x2 ? x1 : x2;
+    uint32_t rx = x1 > x2 ? x1 : x2;
+    uint32_t ty = y1 < y2 ? y1 : y2;
+    uint32_t by = y1 > y2 ? y1 : y2;
+
+    if (!clip_rect(gw, lx, ty, rx - lx + 1U, by - ty + 1U, &rect))
+    {
+        return;
+    }
+
+    if (fill)
+    {
+        for (int row = 0; row < rect.h; row++)
+        {
+            uint32_t *dst = gw->fb + (rect.y + row) * gw->width + rect.x;
+            for (int col = 0; col < rect.w; col++)
+            {
+                dst[col] = rgba;
+            }
         }
     }
+    else
+    {
+        int left   = rect.x;
+        int right  = rect.x + rect.w - 1;
+        int top    = rect.y;
+        int bottom = rect.y + rect.h - 1;
+
+        for (int col = left; col <= right; col++)
+        {
+            set_pixel_raw(gw, col, top, rgba);
+            set_pixel_raw(gw, col, bottom, rgba);
+        }
+        for (int row = top; row <= bottom; row++)
+        {
+            set_pixel_raw(gw, left, row, rgba);
+            set_pixel_raw(gw, right, row, rgba);
+        }
+    }
+
+    mark_dirty(gw, rect.x, rect.y, rect.w, rect.h);
 }
 
 void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint64_t str_ptr, uint32_t size, uint32_t rgba)
 {
+    rgba = rgba_to_argb(rgba);
     (void)emu;
     gui_window_t *gw = find_window(handle);
     if (!gw || !str_ptr) return;
@@ -487,13 +624,22 @@ void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
 
         float cx = (float)x;
         float cy = (float)y + (float)baseline;
-        for (char *p = text; *p; p++) {
-            if (*p == '\n') { cx = (float)x; cy += (float)line_h; continue; }
+        char *p = text;
+        while (*p) {
+            if (*p == '\n') { cx = (float)x; cy += (float)line_h; p++; continue; }
+
+            /* 解码 UTF-8 码点。非法或截断序列按单字节跳过。 */
+            int codepoint = 0;
+            int utf8_len = 0;
+            if (!utf8_next_codepoint(text, p, &codepoint, &utf8_len)) {
+                p++;
+                continue;
+            }
 
             int adv, lsb, x0, y0, x1, y1;
-            /* 获取字符度量 */
-            stbtt_GetCodepointHMetrics(&cf->info, (int)(unsigned char)*p, &adv, &lsb);
-            stbtt_GetCodepointBitmapBox(&cf->info, (int)(unsigned char)*p, scale, scale,
+            /* 获取字符度量 (使用真实码点) */
+            stbtt_GetCodepointHMetrics(&cf->info, codepoint, &adv, &lsb);
+            stbtt_GetCodepointBitmapBox(&cf->info, codepoint, scale, scale,
                                         &x0, &y0, &x1, &y1);
 
             int gw_w = x1 - x0, gw_h = y1 - y0;
@@ -501,7 +647,7 @@ void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
                 uint8_t *glyph = malloc((size_t)(gw_w * gw_h));
                 if (glyph) {
                     stbtt_MakeCodepointBitmap(&cf->info, glyph, gw_w, gw_h, gw_w,
-                                              scale, scale, (int)(unsigned char)*p);
+                                              scale, scale, codepoint);
 
                     uint8_t ar = (uint8_t)((rgba >> 16) & 0xFF);
                     uint8_t ag = (uint8_t)((rgba >>  8) & 0xFF);
@@ -529,7 +675,7 @@ void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
                                 uint8_t fr = (uint8_t)(((unsigned)ar * a + (unsigned)br * (255-a)) / 255);
                                 uint8_t fg = (uint8_t)(((unsigned)ag * a + (unsigned)bg2* (255-a)) / 255);
                                 uint8_t fb2= (uint8_t)(((unsigned)ab * a + (unsigned)bb * (255-a)) / 255);
-                                gw->fb[py * gw->width + px] = 0xFF000000 |
+                                gw->fb[py * gw->width + px] = 0xFF000000U |
                                     ((uint32_t)fr << 16) | ((uint32_t)fg << 8) | fb2;
                             }
                         }
@@ -539,6 +685,7 @@ void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
             }
             cx += (float)adv * scale;
             if (cx > (float)gw->width) { cx = (float)x; cy += (float)line_h; }
+            p += utf8_len;
         }
     } else {
         /* 无字体回退: 色块占位 */
@@ -562,36 +709,49 @@ void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
 void xj380_gui_draw_bmp(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t path_ptr)
 {
-    (void)emu;
     gui_window_t *gw = find_window(handle);
-    if (!gw || !path_ptr) return;
+    SDL_Rect      rect;
+
+    if (!gw || !path_ptr || w == 0 || h == 0 || w > FB_MAX_WIDTH || h > FB_MAX_HEIGHT
+        || !clip_rect(gw, x, y, w, h, &rect))
+    {
+        return;
+    }
 
     char path[512];
     xj380_mem_read_str(emu, path_ptr, path, sizeof(path));
 
-    /* 从 VFS 或宿主文件系统加载 */
     SDL_Surface *surf = IMG_Load(path);
-    if (!surf) {
-        /* 尝试去掉前导 / */
-        if (path[0] == '/') surf = IMG_Load(path + 1);
-        if (!surf) return;
+    if (!surf && path[0] == 47)
+    {
+        surf = IMG_Load(path + 1);
+    }
+    if (!surf)
+    {
+        return;
     }
 
-    /* 拉伸/填充到目标区域 */
     SDL_Surface *scaled = SDL_CreateRGBSurfaceWithFormat(0,
-        (int)w, (int)h, 32, SDL_PIXELFORMAT_RGBA8888);
+        (int)w, (int)h, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!scaled)
+    {
+        SDL_FreeSurface(surf);
+        return;
+    }
+
     SDL_BlitScaled(surf, NULL, scaled, NULL);
 
-    /* 逐像素写入 framebuffer */
-    uint32_t *pixels = (uint32_t*)scaled->pixels;
-    for (int dy = 0; dy < (int)h; dy++) {
-        for (int dx = 0; dx < (int)w; dx++) {
-            if ((int)x + dx < gw->width && (int)y + dy < gw->height) {
-                set_pixel(gw, (int)x + dx, (int)y + dy, pixels[dy * (int)w + dx]);
-            }
-        }
+    uint8_t *pixels = (uint8_t *)scaled->pixels;
+    for (int row = 0; row < rect.h; row++)
+    {
+        uint32_t *src = (uint32_t *)(pixels
+            + (size_t)(row + rect.y - (int)y) * (size_t)scaled->pitch)
+            + rect.x - (int)x;
+        uint32_t *dst = gw->fb + (rect.y + row) * gw->width + rect.x;
+        memcpy(dst, src, (size_t)rect.w * sizeof(uint32_t));
     }
 
+    mark_dirty(gw, rect.x, rect.y, rect.w, rect.h);
     SDL_FreeSurface(scaled);
     SDL_FreeSurface(surf);
 }
@@ -798,10 +958,45 @@ static void queue_event(uint64_t handle, uint64_t type, uint64_t hData, uint64_t
     g_event_tail = next;
 }
 
+static uint64_t pack_utf8_bytes(const char *text, int len)
+{
+    uint64_t value = 0;
+    int n = len > 8 ? 8 : len;
+
+    for (int i = 0; i < n; i++)
+    {
+        value |= (uint64_t)(uint8_t)text[i] << (unsigned)(i * 8);
+    }
+
+    return value;
+}
+
+static void push_test_sdl_events(gui_window_t *gw)
+{
+    if (!g_test_events_enabled || g_test_events_pushed || !gw || !gw->win
+        || !gw->msg_callback_addr)
+    {
+        return;
+    }
+
+    queue_event(gw->handle, XJ380_MSG_CHAR, 0, 0x41);
+    queue_event(gw->handle, XJ380_MSG_SPCHAR, 0, 128);
+    queue_event(gw->handle, XJ380_MSG_MOVE, 11, 22);
+    queue_event(gw->handle, XJ380_MSG_LBUTTON, 33, 44);
+    queue_event(gw->handle, XJ380_MSG_ROLLER, ((uint64_t)55 << 32) | 66, 1);
+
+    g_test_events_pushed = true;
+}
+
 int xj380_gui_poll_events(xj380_emu_t *emu)
 {
     (void)emu;
     if (!g_sdl_initialized || g_window_count == 0) return 0;
+
+    for (int i = 0; i < g_window_count; i++)
+    {
+        push_test_sdl_events(g_windows[i]);
+    }
 
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
@@ -859,7 +1054,7 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
                     sizeof(uint32_t));
                 SDL_Texture *new_tex = SDL_CreateTexture(
                     gw->rend,
-                    SDL_PIXELFORMAT_RGBA8888,
+                    SDL_PIXELFORMAT_ARGB8888,
                     SDL_TEXTUREACCESS_STREAMING,
                     new_width,
                     new_height);
@@ -898,10 +1093,8 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
                         (uint64_t)ev.motion.x, (uint64_t)ev.motion.y);
             break;
 
-        /* ---- 鼠标按键 ---- */
-        case SDL_MOUSEBUTTONDOWN:
-            /* 只处理按下, XJ380 在释放时发送消息 (看4-4-3)...
-               但我们没有 down/up 配对, 简化: down 就发消息 */
+        /* ---- 鼠标按键: XJ380 在释放时发送一次点击手势 ---- */
+        case SDL_MOUSEBUTTONUP:
             switch (ev.button.button) {
             case SDL_BUTTON_LEFT:
                 queue_event(gw->handle, XJ380_MSG_LBUTTON,
@@ -939,11 +1132,24 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
 
         /* ---- 键盘: 字符输入 ---- */
         case SDL_TEXTINPUT:
-            if (ev.text.text[0]) {
+        {
+            const char *p = ev.text.text;
+            while (*p)
+            {
+                int codepoint = 0;
+                int utf8_len = 0;
+                (void)codepoint;
+                if (!utf8_next_codepoint(ev.text.text, p, &codepoint, &utf8_len))
+                {
+                    p++;
+                    continue;
+                }
                 queue_event(gw->handle, XJ380_MSG_CHAR,
-                    0, (uint64_t)(uint8_t)ev.text.text[0]);
+                    0, pack_utf8_bytes(p, utf8_len));
+                p += utf8_len;
             }
             break;
+        }
 
         /* ---- 键盘: 特殊键 ---- */
         case SDL_KEYDOWN: {
@@ -972,6 +1178,9 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
             }
             break;
         }
+
+        case SDL_KEYUP:
+            break;
 
         case SDL_QUIT:
             return 1;
@@ -1011,13 +1220,6 @@ void xj380_gui_load_font(const char *vpath, const uint8_t *data, size_t size)
     printf("[GUI] 字体加载: %s (%zu bytes)\n", vpath, size);
 }
 
-#define EVT_RETURN_TRAMP 0xFFFFF000ULL  /* 事件回调返回 trampoline */
-#define EVT_STACK_TOP     0xFFFFEFF0ULL
-
-/*
- * 将排队的事件注入到模拟程序的消息回调中。
- * 在 xapi_Sleep 循环中被调用。
- */
 void xj380_gui_store_callback(xj380_emu_t *emu, uint64_t handle, uint64_t func)
 {
     (void)emu;
@@ -1029,95 +1231,74 @@ void xj380_gui_store_callback(xj380_emu_t *emu, uint64_t handle, uint64_t func)
     }
 }
 
-void xj380_gui_flush_events(xj380_emu_t *emu)
+bool xj380_gui_dispatch_queued_event(xj380_emu_t *emu, uint64_t return_addr)
 {
-    if (g_event_head == g_event_tail) return;
+    if (g_event_head == g_event_tail)
+    {
+        return false;
+    }
 
     struct uc_struct *uc = xj380_get_uc(emu);
 
-    while (g_event_head != g_event_tail) {
-        gui_event_t *ev = &g_event_queue[g_event_head];
+    while (g_event_head != g_event_tail)
+    {
+        gui_event_t ev = g_event_queue[g_event_head];
         g_event_head = (g_event_head + 1) % 64;
 
-        /* 找目标窗口 */
         gui_window_t *gw = NULL;
-        for (int i = 0; i < g_window_count; i++) {
-            if (g_windows[i]->handle == ev->target_handle) {
+        for (int i = 0; i < g_window_count; i++)
+        {
+            if (g_windows[i]->handle == ev.target_handle)
+            {
                 gw = g_windows[i];
                 break;
             }
         }
-        if (!gw || !gw->msg_callback_addr) continue;
 
-        /* 保存当前 CPU 状态，事件回调不能污染被打断的 guest 代码。 */
-        uint64_t saved_rip = 0, saved_rsp = 0, saved_rflags = 0;
-        uint64_t saved_rax = 0, saved_rbx = 0, saved_rcx = 0, saved_rdx = 0;
-        uint64_t saved_rsi = 0, saved_rdi = 0, saved_rbp = 0;
-        uint64_t saved_r8 = 0, saved_r9 = 0, saved_r10 = 0, saved_r11 = 0;
-        uint64_t saved_r12 = 0, saved_r13 = 0, saved_r14 = 0, saved_r15 = 0;
+        if (!gw || !gw->msg_callback_addr)
+        {
+            continue;
+        }
 
-        uc_reg_read(uc, UC_X86_REG_RIP, &saved_rip);
-        uc_reg_read(uc, UC_X86_REG_RSP, &saved_rsp);
-        uc_reg_read(uc, UC_X86_REG_EFLAGS, &saved_rflags);
-        uc_reg_read(uc, UC_X86_REG_RAX, &saved_rax);
-        uc_reg_read(uc, UC_X86_REG_RBX, &saved_rbx);
-        uc_reg_read(uc, UC_X86_REG_RCX, &saved_rcx);
-        uc_reg_read(uc, UC_X86_REG_RDX, &saved_rdx);
-        uc_reg_read(uc, UC_X86_REG_RSI, &saved_rsi);
-        uc_reg_read(uc, UC_X86_REG_RDI, &saved_rdi);
-        uc_reg_read(uc, UC_X86_REG_RBP, &saved_rbp);
-        uc_reg_read(uc, UC_X86_REG_R8, &saved_r8);
-        uc_reg_read(uc, UC_X86_REG_R9, &saved_r9);
-        uc_reg_read(uc, UC_X86_REG_R10, &saved_r10);
-        uc_reg_read(uc, UC_X86_REG_R11, &saved_r11);
-        uc_reg_read(uc, UC_X86_REG_R12, &saved_r12);
-        uc_reg_read(uc, UC_X86_REG_R13, &saved_r13);
-        uc_reg_read(uc, UC_X86_REG_R14, &saved_r14);
-        uc_reg_read(uc, UC_X86_REG_R15, &saved_r15);
+        uint64_t rsp = 0;
+        if (uc_reg_read(uc, UC_X86_REG_RSP, &rsp) != UC_ERR_OK || rsp < 8)
+        {
+            return false;
+        }
 
-        /* 使用独立事件栈，避免覆盖被打断代码的 red zone。 */
-        uint64_t new_rsp = EVT_STACK_TOP - 8;
-        uint64_t ret_addr = EVT_RETURN_TRAMP;
-        uc_mem_write(uc, new_rsp, &ret_addr, 8);
+        rsp -= 8;
+        if (uc_mem_write(uc, rsp, &return_addr, sizeof(return_addr)) != UC_ERR_OK)
+        {
+            return false;
+        }
 
-        /* 设置回调参数: RDI=Type, RSI=hData, RDX=lData */
-        uint64_t type = ev->type, hd = ev->hData, ld = ev->lData;
+        uint64_t type = ev.type;
+        uint64_t hd   = ev.hData;
+        uint64_t ld   = ev.lData;
+        uint64_t cb   = gw->msg_callback_addr;
+
         uc_reg_write(uc, UC_X86_REG_RDI, &type);
         uc_reg_write(uc, UC_X86_REG_RSI, &hd);
         uc_reg_write(uc, UC_X86_REG_RDX, &ld);
-        uc_reg_write(uc, UC_X86_REG_RSP, &new_rsp);
-
-        /* 跳转到回调 */
-        uint64_t cb = gw->msg_callback_addr;
+        uc_reg_write(uc, UC_X86_REG_RSP, &rsp);
         uc_reg_write(uc, UC_X86_REG_RIP, &cb);
-
-        /* 运行直到返回 trampoline */
-        uc_err ev_err = uc_emu_start(uc, cb, EVT_RETURN_TRAMP, 0, 0);
-
-        /* 恢复状态 (即使执行失败也要尽量恢复)。 */
-        uc_reg_write(uc, UC_X86_REG_RIP, &saved_rip);
-        uc_reg_write(uc, UC_X86_REG_RSP, &saved_rsp);
-        uc_reg_write(uc, UC_X86_REG_EFLAGS, &saved_rflags);
-        uc_reg_write(uc, UC_X86_REG_RAX, &saved_rax);
-        uc_reg_write(uc, UC_X86_REG_RBX, &saved_rbx);
-        uc_reg_write(uc, UC_X86_REG_RCX, &saved_rcx);
-        uc_reg_write(uc, UC_X86_REG_RDX, &saved_rdx);
-        uc_reg_write(uc, UC_X86_REG_RSI, &saved_rsi);
-        uc_reg_write(uc, UC_X86_REG_RDI, &saved_rdi);
-        uc_reg_write(uc, UC_X86_REG_RBP, &saved_rbp);
-        uc_reg_write(uc, UC_X86_REG_R8, &saved_r8);
-        uc_reg_write(uc, UC_X86_REG_R9, &saved_r9);
-        uc_reg_write(uc, UC_X86_REG_R10, &saved_r10);
-        uc_reg_write(uc, UC_X86_REG_R11, &saved_r11);
-        uc_reg_write(uc, UC_X86_REG_R12, &saved_r12);
-        uc_reg_write(uc, UC_X86_REG_R13, &saved_r13);
-        uc_reg_write(uc, UC_X86_REG_R14, &saved_r14);
-        uc_reg_write(uc, UC_X86_REG_R15, &saved_r15);
-
-        if (ev_err != UC_ERR_OK) {
-            fprintf(stderr, "[GUI] 事件注入失败: %s\n", uc_strerror(ev_err));
-        }
+        return true;
     }
+
+    return false;
+}
+
+void xj380_gui_flush_events(xj380_emu_t *emu)
+{
+    uint64_t return_addr = 0;
+    struct uc_struct *uc = xj380_get_uc(emu);
+
+    if (uc_reg_read(uc, UC_X86_REG_RIP, &return_addr) != UC_ERR_OK)
+    {
+        return;
+    }
+
+    (void)xj380_gui_dispatch_queued_event(emu, return_addr);
 }
 
 void xj380_gui_render_all(xj380_emu_t *emu)
@@ -1205,7 +1386,44 @@ void xj380_gui_get_pic_size(xj380_emu_t *emu, uint64_t path_ptr,
 void xj380_gui_read_buffer_a(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t buf_ptr)
 {
-    xj380_gui_read_buffer(emu, handle, x, y, w, h, buf_ptr);
+    gui_window_t *gw = find_window(handle);
+    SDL_Rect      rect;
+
+    if (!buf_ptr || !clip_rect(gw, x, y, w, h, &rect))
+    {
+        return;
+    }
+
+    size_t row_bytes = (size_t)rect.w * 4U;
+    uint8_t *row     = malloc(row_bytes);
+    if (!row)
+    {
+        return;
+    }
+
+    for (int dy = 0; dy < rect.h; dy++)
+    {
+        uint32_t *src = gw->fb + (rect.y + dy) * gw->width + rect.x;
+        for (int dx = 0; dx < rect.w; dx++)
+        {
+            uint32_t rgba = argb_to_rgba(src[dx]);
+            row[(size_t)dx * 4U + 0U] = (uint8_t)((rgba >> 24) & 0xFFU);
+            row[(size_t)dx * 4U + 1U] = (uint8_t)((rgba >> 16) & 0xFFU);
+            row[(size_t)dx * 4U + 2U] = (uint8_t)((rgba >>  8) & 0xFFU);
+            row[(size_t)dx * 4U + 3U] = (uint8_t)( rgba        & 0xFFU);
+        }
+
+        if (xj380_mem_write(
+                emu,
+                buf_ptr + (uint64_t)dy * (uint64_t)w * 4ULL,
+                row,
+                row_bytes) != 0)
+        {
+            break;
+        }
+    }
+
+    free(row);
 }
 
 void xj380_gui_write_buffer_a(xj380_emu_t *emu, uint64_t handle,
@@ -1294,9 +1512,9 @@ void xj380_gui_button(xj380_emu_t *emu, uint64_t handle,
     int tw = (int)strlen(gw->buttons[gw->button_count-1].text) * 8 + 22;
     xj380_gui_draw_rect(emu, handle, (uint32_t)x, (uint32_t)y,
         (uint32_t)((int)x + tw), (uint32_t)((int)y + 24),
-        0xFFCCCCCC, 1 /* fill */);
+        0xCCCCCCFF, 1 /* fill */);
     xj380_gui_draw_text(emu, handle, (uint32_t)((int)x + 11),
-        (uint32_t)((int)y + 4), text_ptr, 1, 0xFF000000);
+        (uint32_t)((int)y + 4), text_ptr, 1, 0x000000FF);
 }
 
 void xj380_gui_emp_button(xj380_emu_t *emu, uint64_t handle,
@@ -1315,7 +1533,7 @@ void xj380_gui_emp_button(xj380_emu_t *emu, uint64_t handle,
     int tw = (int)strlen(gw->buttons[gw->button_count-1].text) * 8 + 22;
     xj380_gui_draw_rect(emu, handle, (uint32_t)x, (uint32_t)y,
         (uint32_t)((int)x + tw), (uint32_t)((int)y + 24),
-        0xFF4488FF, 1);  /* 蓝色强调 */
+        0x4488FFFF, 1);  /* 蓝色强调 */
     xj380_gui_draw_text(emu, handle, (uint32_t)((int)x + 11),
         (uint32_t)((int)y + 4), text_ptr, 1, 0xFFFFFFFF);
 }
@@ -1365,7 +1583,7 @@ void xj380_gui_draw_svg(xj380_emu_t *emu,
     uint32_t width, uint64_t svg_ptr, int enable_trans)
 {
     gui_window_t *gw = find_window(handle);
-    if (!gw || !svg_ptr || width == 0) return;
+    if (!gw || !svg_ptr || width == 0 || width > FB_MAX_WIDTH) return;
 
     char *svg_text = malloc(65536);
     if (!svg_text) return;
@@ -1375,13 +1593,17 @@ void xj380_gui_draw_svg(xj380_emu_t *emu,
     /* 解析 SVG */
     NSVGimage *img = nsvgParse(svg_text, "px", 96.0f);
     free(svg_text);
-    if (!img) return;
+    if (!img || img->width <= 0.0f || img->height <= 0.0f) {
+        if (img) nsvgDelete(img);
+        return;
+    }
 
     /* 按宽度计算缩放 */
     float scale = (float)width / img->width;
     int   h     = (int)(img->height * scale);
     if (h < 1) h = 1;
-    if (h > 4096) h = 4096;
+    if (h > FB_MAX_HEIGHT) h = FB_MAX_HEIGHT;
+    if ((size_t)width > SIZE_MAX / (size_t)h / 4U) { nsvgDelete(img); return; }
 
     /* 光栅化到临时缓冲区 */
     size_t buf_size = (size_t)width * (size_t)h * 4U;
@@ -1412,10 +1634,11 @@ void xj380_gui_draw_svg(xj380_emu_t *emu,
 
             uint32_t rgba = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
                            ((uint32_t)g << 8)  | (uint32_t)b;
-            set_pixel(gw, (int)x + (int)dx, (int)y + dy, rgba);
+            set_pixel_raw(gw, (int)x + (int)dx, (int)y + dy, rgba);
         }
     }
 
+    mark_dirty(gw, (int)x, (int)y, (int)width, h);
     nsvgDeleteRasterizer(nsvg_r);
     nsvgDelete(img);
     free(rast);
@@ -1426,7 +1649,7 @@ void xj380_gui_draw_fa(xj380_emu_t *emu,
     uint32_t width, uint64_t name_ptr, int enable_trans)
 {
     gui_window_t *gw = find_window(handle);
-    if (!gw || !name_ptr || width == 0) return;
+    if (!gw || !name_ptr || width == 0 || width > FB_MAX_WIDTH) return;
 
     /* 从 VFS 或文件系统读 SVG 文件内容 */
     char path[512] = {0};
@@ -1454,12 +1677,16 @@ void xj380_gui_draw_fa(xj380_emu_t *emu,
     /* 复用 DrawSvg 逻辑 */
     NSVGimage *img = nsvgParse(svg, "px", 96.0f);
     free(svg);
-    if (!img) return;
+    if (!img || img->width <= 0.0f || img->height <= 0.0f) {
+        if (img) nsvgDelete(img);
+        return;
+    }
 
     float scale = (float)width / img->width;
     int h = (int)(img->height * scale);
     if (h < 1) h = 1;
-    if (h > 4096) h = 4096;
+    if (h > FB_MAX_HEIGHT) h = FB_MAX_HEIGHT;
+    if ((size_t)width > SIZE_MAX / (size_t)h / 4U) { nsvgDelete(img); return; }
 
     size_t buf_size = (size_t)width * (size_t)h * 4U;
     unsigned char *rast = malloc(buf_size);
@@ -1476,11 +1703,12 @@ void xj380_gui_draw_fa(xj380_emu_t *emu,
             int off = (dy * (int)width + (int)dx) * 4;
             uint8_t r = rast[off], g = rast[off+1], b = rast[off+2], a = rast[off+3];
             if (enable_trans) { r ^= 0xFF; g ^= 0xFF; b ^= 0xFF; }
-            set_pixel(gw, (int)x+(int)dx, (int)y+dy,
-                ((uint32_t)a<<24)|((uint32_t)r<<16)|((uint32_t)g<<8)|(uint32_t)b);
+            set_pixel_raw(gw, (int)x + (int)dx, (int)y + dy,
+                ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
         }
     }
 
+    mark_dirty(gw, (int)x, (int)y, (int)width, h);
     nsvgDeleteRasterizer(nsvg_r);
     nsvgDelete(img);
     free(rast);
