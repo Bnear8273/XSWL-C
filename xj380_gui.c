@@ -18,8 +18,12 @@
 #include <unicorn/unicorn.h>
 #include <unicorn/x86.h>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Wsign-conversion"
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
+#pragma GCC diagnostic pop
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wshadow"
@@ -85,6 +89,34 @@ static gui_window_t *g_windows[MAX_GUI_WINDOWS];
 static int            g_window_count;
 static uint64_t       g_next_handle = 1;
 static bool           g_sdl_initialized;
+
+/* ---- TTF 字体缓存 ---- */
+#define MAX_FONTS 8
+typedef struct {
+    char           path[512];
+    stbtt_fontinfo info;
+    uint8_t       *data;
+    size_t         size;
+    float          scale;
+} cached_font_t;
+
+static cached_font_t g_fonts[MAX_FONTS];
+static int           g_font_count;
+
+static void copy_cstr(char *dst, size_t dst_size, const char *src)
+{
+    if (dst_size == 0) return;
+    snprintf(dst, dst_size, "%s", src ? src : "");
+}
+
+static cached_font_t* find_font(const char *path)
+{
+    /* 找已缓存的字体, 没找到则返回最近加载的 */
+    for (int i = 0; i < g_font_count; i++)
+        if (strcmp(g_fonts[i].path, path) == 0) return &g_fonts[i];
+    return g_font_count > 0 ? &g_fonts[0] : NULL;
+}
+
 
 /* ================================================================
  * SDL2 初始化
@@ -218,7 +250,7 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
     gw->open       = true;
     gw->fullscreen = (sets & XWIN_FULL_SCR) != 0;
     gw->resizable  = (sets & XWIN_SUPPORT_RESIZEABLE) != 0;
-    strncpy(gw->title, title, 255);
+    copy_cstr(gw->title, sizeof(gw->title), title);
 
     g_windows[g_window_count++] = gw;
 
@@ -260,7 +292,7 @@ void xj380_gui_set_window_title(xj380_emu_t *emu, uint64_t handle, uint64_t titl
 
     gui_window_t *gw = find_window(handle);
     if (gw) {
-        strncpy(gw->title, title, 255);
+        copy_cstr(gw->title, sizeof(gw->title), title);
         SDL_SetWindowTitle(gw->win, title);
     }
 }
@@ -356,16 +388,15 @@ void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
         float scale = stbtt_ScaleForPixelHeight(&cf->info, (float)(size ? size : 12));
         int ascent, descent, line_gap;
         stbtt_GetFontVMetrics(&cf->info, &ascent, &descent, &line_gap);
-        int baseline = (int)(ascent * scale);
-        int line_h   = (int)((ascent - descent + line_gap) * scale);
+        int baseline = (int)((float)ascent * scale);
+        int line_h   = (int)((float)(ascent - descent + line_gap) * scale);
 
         float cx = (float)x;
-        float cy = (float)y + baseline;
+        float cy = (float)y + (float)baseline;
         for (char *p = text; *p; p++) {
-            if (*p == '\n') { cx = (float)x; cy += line_h; continue; }
+            if (*p == '\n') { cx = (float)x; cy += (float)line_h; continue; }
 
             int adv, lsb, x0, y0, x1, y1;
-            float gpx_x, gpx_y;
             /* 获取字符度量 */
             stbtt_GetCodepointHMetrics(&cf->info, (int)(unsigned char)*p, &adv, &lsb);
             stbtt_GetCodepointBitmapBox(&cf->info, (int)(unsigned char)*p, scale, scale,
@@ -412,8 +443,8 @@ void xj380_gui_draw_text(xj380_emu_t *emu, uint64_t handle,
                     free(glyph);
                 }
             }
-            cx += adv * scale;
-            if (cx > gw->width) { cx = (float)x; cy += line_h; }
+            cx += (float)adv * scale;
+            if (cx > (float)gw->width) { cx = (float)x; cy += (float)line_h; }
         }
     } else {
         /* 无字体回退: 色块占位 */
@@ -747,27 +778,6 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
     return 0;
 }
 
-/* ---- TTF 字体缓存 ---- */
-#define MAX_FONTS 8
-typedef struct {
-    char           path[512];
-    stbtt_fontinfo info;
-    uint8_t       *data;
-    size_t         size;
-    float          scale;
-} cached_font_t;
-
-static cached_font_t g_fonts[MAX_FONTS];
-static int           g_font_count;
-
-static cached_font_t* find_font(const char *path)
-{
-    /* 找已缓存的字体, 没找到则返回最近加载的 */
-    for (int i = 0; i < g_font_count; i++)
-        if (strcmp(g_fonts[i].path, path) == 0) return &g_fonts[i];
-    return g_font_count > 0 ? &g_fonts[0] : NULL;
-}
-
 void xj380_gui_load_font(const char *vpath, const uint8_t *data, size_t size)
 {
     if (!data || !size || g_font_count >= MAX_FONTS) return;
@@ -782,7 +792,7 @@ void xj380_gui_load_font(const char *vpath, const uint8_t *data, size_t size)
     /* 解析字体 */
     cached_font_t *cf = &g_fonts[g_font_count];
     memset(cf, 0, sizeof(*cf));
-    strncpy(cf->path, vpath, 511);
+    copy_cstr(cf->path, sizeof(cf->path), vpath);
     cf->data = malloc(size);
     if (!cf->data) return;
     memcpy(cf->data, data, size);
@@ -928,15 +938,14 @@ void xj380_gui_draw_sw_text(xj380_emu_t *emu, uint64_t handle,
     xj380_gui_draw_text(emu, handle, x, y, str_ptr, 1, rgba);
 }
 
-void xj380_gui_calc_text_width(xj380_emu_t *emu, uint64_t str_ptr,
-                               uint32_t size, uint64_t width_ptr)
+uint64_t xj380_gui_calc_text_width(xj380_emu_t *emu, uint64_t str_ptr,
+                                  uint32_t size)
 {
     char text[4096];
     xj380_mem_read_str(emu, str_ptr, text, sizeof(text));
     uint32_t char_w = 8 * (size ? size : 2);
     if (char_w < 4) char_w = 4;
-    uint32_t w = char_w * (uint32_t)strlen(text);
-    if (width_ptr) xj380_mem_write(emu, width_ptr, &w, 4);
+    return (uint64_t)char_w * (uint64_t)strlen(text);
 }
 
 void xj380_gui_get_pic_size(xj380_emu_t *emu, uint64_t path_ptr,
@@ -1086,10 +1095,10 @@ void xj380_gui_draw_svg(xj380_emu_t *emu,
     if (h > 4096) h = 4096;
 
     /* 光栅化到临时缓冲区 */
-    int buf_size = width * (uint32_t)h * 4;
-    unsigned char *rast = malloc((size_t)buf_size);
+    size_t buf_size = (size_t)width * (size_t)h * 4U;
+    unsigned char *rast = malloc(buf_size);
     if (!rast) { nsvgDelete(img); return; }
-    memset(rast, 0, (size_t)buf_size);
+    memset(rast, 0, buf_size);
 
     NSVGrasterizer *nsvg_r = nsvgCreateRasterizer();
     if (!nsvg_r) { free(rast); nsvgDelete(img); return; }
@@ -1145,7 +1154,11 @@ void xj380_gui_draw_fa(xj380_emu_t *emu,
 
     char *svg = malloc((size_t)sz + 1);
     if (!svg) { fclose(fp); return; }
-    (void)fread(svg, 1, (size_t)sz, fp);
+    if (fread(svg, 1, (size_t)sz, fp) != (size_t)sz) {
+        free(svg);
+        fclose(fp);
+        return;
+    }
     svg[sz] = '\0';
     fclose(fp);
 
@@ -1159,10 +1172,10 @@ void xj380_gui_draw_fa(xj380_emu_t *emu,
     if (h < 1) h = 1;
     if (h > 4096) h = 4096;
 
-    int buf_size = width * (uint32_t)h * 4;
-    unsigned char *rast = malloc((size_t)buf_size);
+    size_t buf_size = (size_t)width * (size_t)h * 4U;
+    unsigned char *rast = malloc(buf_size);
     if (!rast) { nsvgDelete(img); return; }
-    memset(rast, 0, (size_t)buf_size);
+    memset(rast, 0, buf_size);
 
     NSVGrasterizer *nsvg_r = nsvgCreateRasterizer();
     if (!nsvg_r) { free(rast); nsvgDelete(img); return; }

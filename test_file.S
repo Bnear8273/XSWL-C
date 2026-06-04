@@ -34,7 +34,7 @@ _start:
 
     lea  rdi, [rip + s_path]
     lea  rsi, [rip + s_data]
-    mov  rdx, 30
+    mov  rdx, s_data_end - s_data
     xor  rcx, rcx
     CALL_X X_WRITEFILE
     lea  rdi, [rip + s_written]
@@ -51,7 +51,7 @@ _start:
 
     lea  rdi, [rip + s_path]
     mov  rsi, r13
-    mov  rdx, 30
+    mov  rdx, 512
     xor  rcx, rcx
     CALL_X X_READFILE
     lea  rdi, [rip + s_read]
@@ -102,7 +102,7 @@ s_root:
     .asciz "/"
 s_data:
     .ascii "XSWL File I/O Test - OK!\nHello!"
-    .byte 0
+s_data_end:
 s_written:
     .asciz "[1] WriteFile OK"
 s_read:

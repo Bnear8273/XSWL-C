@@ -120,6 +120,11 @@ static int wr_str(xj380_emu_t *emu, uint64_t addr, const char *str) {
         (const uint8_t*)str, strlen(str) + 1);
 }
 
+static void copy_cstr(char *dst, size_t dst_size, const char *src) {
+    if (dst_size == 0) return;
+    snprintf(dst, dst_size, "%s", src ? src : "");
+}
+
 int xj380_mem_read(xj380_emu_t *emu, uint64_t addr, void *dst, size_t len) {
     return (int)uc_mem_read(emu->uc, addr, (uint8_t*)dst, len);
 }
@@ -171,11 +176,15 @@ static int vfs_import_host(xj380_emu_t *emu, const char *vpath, const char *hpat
     if (sz > 0) {
         d = malloc(sz);
         if (!d) { fclose(fp); return -1; }
-        (void)fread(d, 1, sz, fp);
+        if (fread(d, 1, sz, fp) != sz) {
+            free(d);
+            fclose(fp);
+            return -1;
+        }
     }
     fclose(fp);
     int idx = emu->vfs_count++;
-    strncpy(emu->vfs[idx].path, vpath, VFS_PATH_MAX - 1);
+    copy_cstr(emu->vfs[idx].path, sizeof(emu->vfs[idx].path), vpath);
 #ifdef XJ380_GUI
     xj380_gui_load_font(vpath, d, sz);
 #endif
@@ -189,7 +198,7 @@ static int vfs_create(xj380_emu_t *emu, const char *path, bool is_dir) {
     if (vfs_find(emu, path) >= 0) return -1;
     if (vfs_ensure(emu) != 0) return -1;
     int idx = emu->vfs_count++;
-    strncpy(emu->vfs[idx].path, path, VFS_PATH_MAX - 1);
+    copy_cstr(emu->vfs[idx].path, sizeof(emu->vfs[idx].path), path);
     emu->vfs[idx].data   = NULL;
     emu->vfs[idx].size   = 0;
     emu->vfs[idx].is_dir = is_dir;
@@ -334,9 +343,12 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
         for (size_t off = 0; off < scan_size - 1; off++) {
             if (scan[off] == 0x0F && scan[off + 1] == 0x05) {
                 uint64_t saddr = ph.p_vaddr + off;
+                _Pragma("GCC diagnostic push")
+                _Pragma("GCC diagnostic ignored \"-Wpedantic\"")
                 (void)uc_hook_add(emu->uc, &h_sys, UC_HOOK_CODE,
                                   (void*)xj380_syscall_hook, emu,
                                   saddr, saddr + 1);
+                _Pragma("GCC diagnostic pop")
                 printf("[ELF] 发现 syscall @ 0x%llx, 已注册 hook\n",
                        (unsigned long long)saddr);
             }
@@ -414,64 +426,68 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
         FILE *fp2 = fopen(path, "rb");
         if (fp2) {
             Elf64_Ehdr eh2;
-            fread(&eh2, sizeof(eh2), 1, fp2);
             uint64_t main_addr = 0;
 
-            /* 找 .symtab 和对应的 .strtab (通过 sh_link) */
-            uint64_t sym_off = 0, sym_sz = 0, str_off = 0, str_sz = 0;
-            uint32_t sym_link = 0;
-            for (int i = 0; i < eh2.e_shnum; i++) {
-                fseek(fp2, (long)(eh2.e_shoff + (uint64_t)i * eh2.e_shentsize), SEEK_SET);
-                uint32_t sh_type = 0, sh_link = 0;
-                uint64_t sh_offset = 0, sh_size = 0;
-                fseek(fp2, 4, SEEK_CUR);              /* sh_name */
-                fread(&sh_type,   4, 1, fp2);          /* sh_type */
-                fseek(fp2, 16, SEEK_CUR);              /* flags(8)+addr(8) */
-                fread(&sh_offset, 8, 1, fp2);          /* sh_offset */
-                fread(&sh_size,   8, 1, fp2);          /* sh_size */
-                fread(&sh_link,   4, 1, fp2);          /* sh_link */
-                if (sh_type == 2) { sym_off = sh_offset; sym_sz = sh_size; sym_link = sh_link; }
-                if (sh_type == 3 && (uint32_t)i == sym_link) { str_off = sh_offset; str_sz = sh_size; }
-            }
+            if (fread(&eh2, sizeof(eh2), 1, fp2) == 1) {
+                /* 找 .symtab 和对应的 .strtab (通过 sh_link) */
+                uint64_t sym_off = 0, sym_sz = 0, str_off = 0, str_sz = 0;
+                uint32_t sym_link = 0;
+                for (int i = 0; i < eh2.e_shnum; i++) {
+                    fseek(fp2, (long)(eh2.e_shoff + (uint64_t)i * eh2.e_shentsize), SEEK_SET);
+                    uint32_t sh_type = 0, sh_link = 0;
+                    uint64_t sh_offset = 0, sh_size = 0;
+                    fseek(fp2, 4, SEEK_CUR);              /* sh_name */
+                    if (fread(&sh_type,   4, 1, fp2) != 1) break;
+                    fseek(fp2, 16, SEEK_CUR);              /* flags(8)+addr(8) */
+                    if (fread(&sh_offset, 8, 1, fp2) != 1) break;
+                    if (fread(&sh_size,   8, 1, fp2) != 1) break;
+                    if (fread(&sh_link,   4, 1, fp2) != 1) break;
+                    if (sh_type == 2) { sym_off = sh_offset; sym_sz = sh_size; sym_link = sh_link; }
+                    if (sh_type == 3 && (uint32_t)i == sym_link) { str_off = sh_offset; str_sz = sh_size; }
+                }
 
-            if (sym_off && sym_sz && str_off && str_sz) {
-                char *strtab = malloc((size_t)str_sz);
-                fseek(fp2, (long)str_off, SEEK_SET);
-                fread(strtab, 1, (size_t)str_sz, fp2);
+                if (sym_off && sym_sz && str_off && str_sz) {
+                    char *strtab = malloc((size_t)str_sz);
+                    if (strtab) {
+                        fseek(fp2, (long)str_off, SEEK_SET);
+                        if (fread(strtab, 1, (size_t)str_sz, fp2) == str_sz) {
+                            fseek(fp2, (long)sym_off, SEEK_SET);
+                            for (uint64_t j = 0; j < sym_sz / 24; j++) { /* Elf64_Sym = 24 bytes */
+                                uint32_t st_name = 0;
+                                uint64_t st_value = 0;
+                                fseek(fp2, (long)(sym_off + j * 24), SEEK_SET);
+                                if (fread(&st_name,  4, 1, fp2) != 1) continue;
+                                fseek(fp2, 4, SEEK_CUR);  /* st_info+st_other+st_shndx */
+                                if (fread(&st_value, 8, 1, fp2) != 1) continue;
+                                if (st_value > 0 && st_name < str_sz) {
+                                    if (strcmp(strtab + st_name, "main") == 0 ||
+                                        strncmp(strtab + st_name, "_Z4main", 7) == 0) {
+                                        main_addr = st_value;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        free(strtab);
+                    }
+                }
 
-                fseek(fp2, (long)sym_off, SEEK_SET);
-                for (uint64_t j = 0; j < sym_sz / 24; j++) { /* Elf64_Sym = 24 bytes */
-                    uint32_t st_name = 0;
-                    uint64_t st_value = 0;
-                    fseek(fp2, (long)(sym_off + j * 24), SEEK_SET);
-                    fread(&st_name,  4, 1, fp2);
-                    fseek(fp2, 4, SEEK_CUR);              /* st_info+st_other+st_shndx */
-                    fread(&st_value, 8, 1, fp2);          /* st_value */
-                    if (st_value > 0 && st_name < str_sz) {
-                        if (strcmp(strtab + st_name, "main") == 0 ||
-                            strncmp(strtab + st_name, "_Z4main", 7) == 0) {
-                            main_addr = st_value;
-                            break;
+                if (main_addr) {
+                    uint64_t patch_off = 0x20e7d8;
+                    uint8_t mov_rax[7];
+                    xj380_mem_read(emu, patch_off, mov_rax, 7);
+                    if (mov_rax[0] == 0x48 && mov_rax[1] == 0xC7 && mov_rax[2] == 0xC0) {
+                        uint32_t existing = 0;
+                        memcpy(&existing, mov_rax + 3, 4);
+                        if (existing == 0) {
+                            uint32_t addr32 = (uint32_t)main_addr;
+                            xj380_mem_write(emu, patch_off + 3, &addr32, 4);
+                            printf("[ELF] 已修补 main 地址: 0x%x\n", addr32);
                         }
                     }
                 }
-                free(strtab);
             }
 
-            if (main_addr) {
-                uint64_t patch_off = 0x20e7d8;
-                uint8_t mov_rax[7];
-                xj380_mem_read(emu, patch_off, mov_rax, 7);
-                if (mov_rax[0] == 0x48 && mov_rax[1] == 0xC7 && mov_rax[2] == 0xC0) {
-                    uint32_t existing = 0;
-                    memcpy(&existing, mov_rax + 3, 4);
-                    if (existing == 0) {
-                        uint32_t addr32 = (uint32_t)main_addr;
-                        xj380_mem_write(emu, patch_off + 3, &addr32, 4);
-                        printf("[ELF] 已修补 main 地址: 0x%x\n", addr32);
-                    }
-                }
-            }
             fclose(fp2);
         }
     }
@@ -695,16 +711,17 @@ static void tramp_hook(uc_engine *uc, uint64_t addr, uint32_t size, void *user_d
     int syscall_no = (int)((addr - XJ380_TRAMP_BASE) / TRAMP_SLOT_SIZE);
     if (syscall_no < 0 || syscall_no >= XAPI_COUNT) return;
 
-    /* 7-arg 兼容: 压 R9 入栈, 统一两路径 (此处 [RSP+8] 有 arg7) */
-    uint64_t my_r9 = r(emu, UC_X86_REG_R9);
+    /* 7-arg 兼容: SysV 调用下第 7 参数在返回地址之后。 */
     uint64_t my_sp = r(emu, UC_X86_REG_RSP);
+    uint64_t stack_arg7 = 0;
+    (void)uc_mem_read(uc, my_sp + 8, (uint8_t*)&stack_arg7, 8);
     my_sp -= 8;
     w(emu, UC_X86_REG_RSP, my_sp);
-    xj380_mem_write(emu, my_sp, &my_r9, 8);
+    xj380_mem_write(emu, my_sp, &stack_arg7, 8);
 
     dispatch_xapi(emu, syscall_no);
 
-    /* 弹出 R9, 露出返回地址 */
+    /* 弹出临时压入的第 7 参数, 露出返回地址 */
     my_sp += 8;
     w(emu, UC_X86_REG_RSP, my_sp);
 
@@ -837,7 +854,7 @@ static void h_SEARCHFILE(xj380_emu_t *e) {
         if (strncmp(e->vfs[i].path, path, pl) == 0) {
             const char *nm = e->vfs[i].path + pl; if (*nm == '/') nm++;
             if (!*nm) continue;
-            strncpy(db[cnt].filename, nm, 255);
+            copy_cstr(db[cnt].filename, sizeof(db[cnt].filename), nm);
             db[cnt].length   = e->vfs[i].size;
             db[cnt].filetype = e->vfs[i].is_dir ? 1 : 0;
             cnt++;
@@ -874,37 +891,57 @@ static void h_RENAMEFILE(xj380_emu_t *e) {
     char op[512], np[512];
     xj380_mem_read_str(e, oa, op, sizeof(op)); xj380_mem_read_str(e, na, np, sizeof(np));
     int idx = vfs_find(e, op);
-    if (idx >= 0) strncpy(e->vfs[idx].path, np, VFS_PATH_MAX - 1);
+    if (idx >= 0) copy_cstr(e->vfs[idx].path, sizeof(e->vfs[idx].path), np);
 }
 static void h_READFILE(xj380_emu_t *e) {
     uint64_t pa = r(e, UC_X86_REG_RDI), ba = r(e, UC_X86_REG_RSI);
     uint64_t sz = r(e, UC_X86_REG_RDX),  off = r(e, UC_X86_REG_RCX);
+    w(e, UC_X86_REG_RAX, 0);
     if (!ba || !sz) return;
-    char p[512]; xj380_mem_read_str(e, pa, p, sizeof(p));
+    char p[512];
+    if (xj380_mem_read_str(e, pa, p, sizeof(p)) != 0) return;
     int idx = vfs_find(e, p);
-    if (idx >= 0 && e->vfs[idx].data && off < e->vfs[idx].size) {
-        size_t cp = (off + sz > e->vfs[idx].size) ? (e->vfs[idx].size - off) : (size_t)sz;
-        xj380_mem_write(e, ba, e->vfs[idx].data + off, cp);
+    if (idx < 0 || !e->vfs[idx].data || off >= e->vfs[idx].size) {
+        uint8_t zero = 0;
+        (void)xj380_mem_write(e, ba, &zero, 1);
+        return;
     }
+    size_t avail = e->vfs[idx].size - (size_t)off;
+    size_t cp = ((uint64_t)avail < sz) ? avail : (size_t)sz;
+    if (xj380_mem_write(e, ba, e->vfs[idx].data + off, cp) != 0) return;
+    if (cp < (size_t)sz) {
+        size_t rest = (size_t)sz - cp;
+        uint8_t *zeros = calloc(1, rest);
+        if (zeros) {
+            (void)xj380_mem_write(e, ba + cp, zeros, rest);
+            free(zeros);
+        }
+    }
+    w(e, UC_X86_REG_RAX, (uint64_t)cp);
 }
 static void h_WRITEFILE(xj380_emu_t *e) {
     uint64_t pa = r(e, UC_X86_REG_RDI), ba = r(e, UC_X86_REG_RSI);
     uint64_t sz = r(e, UC_X86_REG_RDX),  off = r(e, UC_X86_REG_RCX);
-    if (!ba || !sz) return;
-    char p[512]; xj380_mem_read_str(e, pa, p, sizeof(p));
+    w(e, UC_X86_REG_RAX, 0);
+    if (!ba || !sz || off > SIZE_MAX || sz > SIZE_MAX || off > UINT64_MAX - sz) return;
+    char p[512];
+    if (xj380_mem_read_str(e, pa, p, sizeof(p)) != 0) return;
     int idx = vfs_find(e, p);
     if (idx < 0) idx = vfs_create(e, p, false);
     if (idx >= 0) {
         vfs_entry_t *et = &e->vfs[idx];
         size_t ns = (size_t)(off + sz);
+        size_t old_size = et->size;
         if (ns > et->size) {
             uint8_t *nd = realloc(et->data, ns);
             if (!nd) return;
             et->data = nd;
+            if ((size_t)off > old_size) memset(et->data + old_size, 0, (size_t)off - old_size);
             et->size = ns;
         }
-        xj380_mem_read(e, ba, et->data + off, (size_t)sz);
+        if (xj380_mem_read(e, ba, et->data + off, (size_t)sz) != 0) return;
         et->emu_cached = false;  /* 内容变了, 缓存失效 */
+        w(e, UC_X86_REG_RAX, sz);
     }
 }
 static void h_RMDIR(xj380_emu_t *e) { h_DELETEFILE(e); }
@@ -946,7 +983,7 @@ static void h_EXIT(xj380_emu_t *e) {
     uint64_t v = r(e, UC_X86_REG_RDI);
     e->running  = false;
     e->exit_code = (int)v;
-    /* 不调 uc_emu_stop——同线程内无效, 由 xj380_run 循环检测 running */
+    (void)uc_emu_stop(e->uc);
 }
 static void h_GETTASKLIST(xj380_emu_t *e) {
     uint64_t ba = r(e, UC_X86_REG_RDI); uint64_t mc = r(e, UC_X86_REG_RSI);
@@ -956,8 +993,8 @@ static void h_GETTASKLIST(xj380_emu_t *e) {
         ti.pid  = 1;
         ti.ppid = 0;
         ti.process_status = 0;  /* running */
-        strncpy(ti.process_name, "xswl-app", XJ380_TASK_NAME_LEN - 1);
-        strncpy(ti.thread_name,  "main",    XJ380_TASK_NAME_LEN - 1);
+        copy_cstr(ti.process_name, sizeof(ti.process_name), "xswl-app");
+        copy_cstr(ti.thread_name,  sizeof(ti.thread_name),  "main");
         xj380_mem_write(e, ba, &ti, sizeof(ti));
     }
     w(e, UC_X86_REG_RAX, 1);
@@ -974,7 +1011,7 @@ static void h_GETCURRENTUSER(xj380_emu_t *e) {
     if (a) {
         UserInfo ui;
         memset(&ui, 0, sizeof(ui));
-        strncpy(ui.name, "Admin", 63);
+        copy_cstr(ui.name, sizeof(ui.name), "Admin");
         ui.user_type = 2;
         xj380_mem_write(e, a, &ui, sizeof(ui));
     }
@@ -1002,6 +1039,7 @@ static void h_BROKEN(xj380_emu_t *e) {
     uint64_t a = r(e, UC_X86_REG_RDI); char b[4096];
     fprintf(stderr, "\n[崩溃] %s\n", xj380_mem_read_str(e, a, b, sizeof(b)) == 0 ? b : "(无信息)");
     e->running = false;
+    (void)uc_emu_stop(e->uc);
 }
 static void h_SENDAPPMESSAGE(xj380_emu_t *e) {
     uint64_t ta = r(e, UC_X86_REG_RDI), tx = r(e, UC_X86_REG_RSI);
@@ -1166,7 +1204,9 @@ static void gh_DRAWLINE(xj380_emu_t *e) {
         (uint32_t)r(e,UC_X86_REG_R8), (uint32_t)r(e,UC_X86_REG_R9));
 }
 static void gh_DRAWRECT(xj380_emu_t *e) {
-    uint64_t fill = r(e, UC_X86_REG_R9);
+    uint64_t rsp = r(e, UC_X86_REG_RSP);
+    uint64_t fill = 0;
+    xj380_mem_read(e, rsp, &fill, 8);
     xj380_gui_draw_rect(e, GETH, (uint32_t)r(e,UC_X86_REG_RSI),
         (uint32_t)r(e,UC_X86_REG_RDX), (uint32_t)r(e,UC_X86_REG_RCX),
         (uint32_t)r(e,UC_X86_REG_R8), (uint32_t)r(e,UC_X86_REG_R9), (int)fill);
@@ -1177,7 +1217,7 @@ static void gh_DRAWTEXT(xj380_emu_t *e) {
         (uint32_t)r(e,UC_X86_REG_R8), (uint32_t)r(e,UC_X86_REG_R9));
 }
 static void gh_DRAWTEXTL(xj380_emu_t *e) {
-    /* 7 参数: syscall/tramp 两路径都已压 R9 入栈 → [RSP+0] = 7th arg */
+    /* 7 参数: wrapper 入口统一把第 7 参数暂存在 [RSP+0]。 */
     uint64_t rsp = r(e, UC_X86_REG_RSP);
     uint64_t width_ptr = 0;
     xj380_mem_read(e, rsp, &width_ptr, 8);
@@ -1191,8 +1231,9 @@ static void gh_DRAWSWTEXT(xj380_emu_t *e) {
         (uint32_t)r(e,UC_X86_REG_R8));
 }
 static void gh_CALCTEXTWIDTH(xj380_emu_t *e) {
-    xj380_gui_calc_text_width(e, r(e,UC_X86_REG_RDI),
-        (uint32_t)r(e,UC_X86_REG_RSI), r(e,UC_X86_REG_RDX));
+    uint64_t width = xj380_gui_calc_text_width(e, r(e,UC_X86_REG_RDI),
+        (uint32_t)r(e,UC_X86_REG_RSI));
+    w(e, UC_X86_REG_RAX, width);
 }
 static void gh_DRAWBMP(xj380_emu_t *e) {
     xj380_gui_draw_bmp(e, GETH, (uint32_t)r(e,UC_X86_REG_RSI),
@@ -1210,8 +1251,8 @@ static void gh_DRAWPICTURE(xj380_emu_t *e) {
         (uint32_t)r(e,UC_X86_REG_R8), r(e,UC_X86_REG_R9));
 }
 static void gh_GETPICSIZE(xj380_emu_t *e) {
-    xj380_gui_get_pic_size(e, r(e,UC_X86_REG_RDI),
-        r(e,UC_X86_REG_RSI), r(e,UC_X86_REG_RDX));
+    xj380_gui_get_pic_size(e, r(e,UC_X86_REG_RDX),
+        r(e,UC_X86_REG_RDI), r(e,UC_X86_REG_RSI));
 }
 static void gh_READBUFFER(xj380_emu_t *e) {
     xj380_gui_read_buffer(e, GETH, (uint32_t)r(e,UC_X86_REG_RSI),
@@ -1361,7 +1402,7 @@ xj380_emu_t* xj380_create(void)
 
     /* Admin 用户 */
     memset(&emu->current_user, 0, sizeof(emu->current_user));
-    strncpy(emu->current_user.name, "Admin", 63);
+    copy_cstr(emu->current_user.name, sizeof(emu->current_user.name), "Admin");
     emu->current_user.user_type = 2;
 
     /* VFS 根 + 系统目录 (防止程序找不到系统文件死循环) */
@@ -1377,6 +1418,8 @@ xj380_emu_t* xj380_create(void)
 
     /* trampoline 范围 hook: 截获所有 xapi 调用 */
     uc_hook h_tramp;
+    _Pragma("GCC diagnostic push")
+    _Pragma("GCC diagnostic ignored \"-Wpedantic\"")
     (void)uc_hook_add(emu->uc, &h_tramp, UC_HOOK_CODE,
                       (void*)tramp_hook, emu,
                       XJ380_TRAMP_BASE, XJ380_TRAMP_BASE + XJ380_TRAMP_SIZE);
@@ -1386,6 +1429,7 @@ xj380_emu_t* xj380_create(void)
     (void)uc_hook_add(emu->uc, &h_sys, UC_HOOK_INTR,
                       (void*)on_syscall, emu,
                       UC_X86_INS_SYSCALL, (uint64_t)-1, (uint64_t)0);
+    _Pragma("GCC diagnostic pop")
 
 #ifdef DEBUG_TRACE
     /* 调试：全范围指令 trace */
@@ -1447,12 +1491,13 @@ int xj380_run(xj380_emu_t *emu, int host_argc, char **host_argv)
     while (emu->running) {
         uc_err err = uc_emu_start(emu->uc, emu->entry_point,
                                   0xFFFFFFFFFFFFFFFFULL, 0, 50000);
+        if (!emu->running) break;
         if (err == UC_ERR_OK) {
             int ev = xj380_gui_poll_events(emu);
             if (ev == 2) { emu->running = false; break; }
             xj380_gui_render_all(emu);
             xj380_gui_flush_events(emu);
-        } else if (err == UC_ERR_EXCEPTION) {
+        } else {
             snprintf(emu->error, sizeof(emu->error), "uc_emu_start: %s", uc_strerror(err));
             return -1;
         }

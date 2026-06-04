@@ -41,8 +41,8 @@ void xj380_gui_draw_text_l(xj380_emu_t *emu, uint64_t handle,
 void xj380_gui_draw_sw_text(xj380_emu_t *emu, uint64_t handle,
                             uint32_t x, uint32_t y, uint64_t str_ptr,
                             uint32_t rgba);
-void xj380_gui_calc_text_width(xj380_emu_t *emu, uint64_t str_ptr,
-                               uint32_t size, uint64_t width_ptr);
+uint64_t xj380_gui_calc_text_width(xj380_emu_t *emu, uint64_t str_ptr,
+                                  uint32_t size);
 
 /* 图片 */
 void xj380_gui_draw_bmp(xj380_emu_t *emu, uint64_t handle,

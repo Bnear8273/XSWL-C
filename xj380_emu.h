@@ -55,7 +55,7 @@ typedef struct {
 #define XWIN_NORMAL           0x00
 #define XWIN_FRAME_OFF        0x01
 #define XWIN_FULL_SCR         0x02
-#define XWIN_SUPPORT_RESIZEABLE 0x04
+#define XWIN_SUPPORT_RESIZEABLE 0x80
 
 /* 文件类型 (手册 3-2-1) */
 typedef struct {
