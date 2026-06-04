@@ -82,6 +82,8 @@ static int  dispatch_xapi(xj380_emu_t *emu, int syscall_no);
 static void xj380_syscall_hook(uc_engine *uc, uint64_t addr, uint32_t size, void *user_data);
 static void h_SYSBRK(xj380_emu_t *e);
 static void h_CLOCKGETTIME(xj380_emu_t *e);
+static void h_WRITE(xj380_emu_t *e);
+static void h_OPEN(xj380_emu_t *e);
 
 /* ================================================================
  * 辅助：寄存器读写
@@ -625,6 +627,12 @@ static void xj380_syscall_hook(uc_engine *uc, uint64_t addr, uint32_t size, void
         h_SYSBRK(emu);
     } else if (xj380_no == 228) {
         h_CLOCKGETTIME(emu);
+    } else if (xj380_no == 1) {
+        h_WRITE(emu);
+    } else if (xj380_no == 2 || xj380_no == 257) {
+        h_OPEN(emu);   /* SYS_OPEN / SYS_OPENAT */
+    } else if (xj380_no == 3) {
+        w(emu, UC_X86_REG_RAX, 0);  /* SYS_CLOSE: no-op return 0 */
     } else {
         int internal_no = map_xj380_to_internal(xj380_no);
         if (internal_no >= 0 && internal_no < XAPI_COUNT && handlers[internal_no]) {
@@ -773,8 +781,11 @@ static void h_OPENFILE(xj380_emu_t *e) {
     if (idx < 0) {
         const char *hp = (*p == '/') ? p + 1 : p;
         idx = vfs_import_host(e, p, hp);
-        if (idx < 0) idx = vfs_create(e, p, false);
-        if (idx < 0) { w(e, UC_X86_REG_RAX, 0); return; }
+        if (idx < 0) {
+            /* 文件不存在且导入失败 → 返回 NULL, 不创建空文件 */
+            w(e, UC_X86_REG_RAX, 0);
+            return;
+        }
     }
     vfs_entry_t *ent = &e->vfs[idx];
     uint64_t xf = emu_brk(e, 16);
@@ -1045,6 +1056,35 @@ static void h_CLOCKGETTIME(xj380_emu_t *e) {
         xj380_mem_write(e, tp + 8,  &nsec, 8);
     }
     w(e, UC_X86_REG_RAX, 0);  /* 成功 */
+}
+
+/* SYS_WRITE: write(fd, buf, count) → stdout */
+static void h_WRITE(xj380_emu_t *e) {
+    uint64_t buf  = r(e, UC_X86_REG_RSI);  /* arg2 */
+    uint64_t cnt  = r(e, UC_X86_REG_RDX);  /* arg3 */
+    char tmp[4096];
+    size_t n = cnt < sizeof(tmp)-1 ? (size_t)cnt : sizeof(tmp)-1;
+    xj380_mem_read(e, buf, tmp, n);
+    tmp[n] = 0;
+    fwrite(tmp, 1, n, stdout);
+    fflush(stdout);
+    w(e, UC_X86_REG_RAX, (uint64_t)n);
+}
+
+/* SYS_OPEN(2): path=RDI, flags=RSI, mode=RDX
+   SYS_OPENAT(257): dirfd=RDI, path=RSI, flags=RDX, mode=RCX */
+static void h_OPEN(xj380_emu_t *e) {
+    uint64_t rax = r(e, UC_X86_REG_RAX);
+    uint64_t path = (rax == 2) ? r(e, UC_X86_REG_RDI) : r(e, UC_X86_REG_RSI);
+    char p[512];
+    xj380_mem_read_str(e, path, p, sizeof(p));
+    int idx = vfs_find(e, p);
+    if (idx < 0) {
+        const char *hp = (*p == '/') ? p + 1 : p;
+        idx = vfs_import_host(e, p, hp);
+        if (idx < 0) { w(e, UC_X86_REG_RAX, UINT64_MAX); return; }
+    }
+    w(e, UC_X86_REG_RAX, (uint64_t)(idx + 3));
 }
 
 static void h_MAPMEMORY(xj380_emu_t *e) {
