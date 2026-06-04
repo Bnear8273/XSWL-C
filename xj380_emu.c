@@ -81,6 +81,7 @@ struct xj380_emu {
 static int  dispatch_xapi(xj380_emu_t *emu, int syscall_no);
 static void xj380_syscall_hook(uc_engine *uc, uint64_t addr, uint32_t size, void *user_data);
 static void h_SYSBRK(xj380_emu_t *e);
+static void h_CLOCKGETTIME(xj380_emu_t *e);
 
 /* ================================================================
  * 辅助：寄存器读写
@@ -400,6 +401,73 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
     w(emu, UC_X86_REG_RSP, rsp);
     w(emu, UC_X86_REG_RBP, rsp);
 
+    /* 补丁: 如果 CRT 中 main 地址为 0, 从 ELF 符号表读取并填入 */
+    {
+        FILE *fp2 = fopen(path, "rb");
+        if (fp2) {
+            Elf64_Ehdr eh2;
+            fread(&eh2, sizeof(eh2), 1, fp2);
+            uint64_t main_addr = 0;
+
+            /* 找 .symtab 和对应的 .strtab (通过 sh_link) */
+            uint64_t sym_off = 0, sym_sz = 0, str_off = 0, str_sz = 0;
+            uint32_t sym_link = 0;
+            for (int i = 0; i < eh2.e_shnum; i++) {
+                fseek(fp2, (long)(eh2.e_shoff + (uint64_t)i * eh2.e_shentsize), SEEK_SET);
+                uint32_t sh_type = 0, sh_link = 0;
+                uint64_t sh_offset = 0, sh_size = 0;
+                fseek(fp2, 4, SEEK_CUR);              /* sh_name */
+                fread(&sh_type,   4, 1, fp2);          /* sh_type */
+                fseek(fp2, 16, SEEK_CUR);              /* flags(8)+addr(8) */
+                fread(&sh_offset, 8, 1, fp2);          /* sh_offset */
+                fread(&sh_size,   8, 1, fp2);          /* sh_size */
+                fread(&sh_link,   4, 1, fp2);          /* sh_link */
+                if (sh_type == 2) { sym_off = sh_offset; sym_sz = sh_size; sym_link = sh_link; }
+                if (sh_type == 3 && (uint32_t)i == sym_link) { str_off = sh_offset; str_sz = sh_size; }
+            }
+
+            if (sym_off && sym_sz && str_off && str_sz) {
+                char *strtab = malloc((size_t)str_sz);
+                fseek(fp2, (long)str_off, SEEK_SET);
+                fread(strtab, 1, (size_t)str_sz, fp2);
+
+                fseek(fp2, (long)sym_off, SEEK_SET);
+                for (uint64_t j = 0; j < sym_sz / 24; j++) { /* Elf64_Sym = 24 bytes */
+                    uint32_t st_name = 0;
+                    uint64_t st_value = 0;
+                    fseek(fp2, (long)(sym_off + j * 24), SEEK_SET);
+                    fread(&st_name,  4, 1, fp2);
+                    fseek(fp2, 4, SEEK_CUR);              /* st_info+st_other+st_shndx */
+                    fread(&st_value, 8, 1, fp2);          /* st_value */
+                    if (st_value > 0 && st_name < str_sz) {
+                        if (strcmp(strtab + st_name, "main") == 0 ||
+                            strncmp(strtab + st_name, "_Z4main", 7) == 0) {
+                            main_addr = st_value;
+                            break;
+                        }
+                    }
+                }
+                free(strtab);
+            }
+
+            if (main_addr) {
+                uint64_t patch_off = 0x20e7d8;
+                uint8_t mov_rax[7];
+                xj380_mem_read(emu, patch_off, mov_rax, 7);
+                if (mov_rax[0] == 0x48 && mov_rax[1] == 0xC7 && mov_rax[2] == 0xC0) {
+                    uint32_t existing = 0;
+                    memcpy(&existing, mov_rax + 3, 4);
+                    if (existing == 0) {
+                        uint32_t addr32 = (uint32_t)main_addr;
+                        xj380_mem_write(emu, patch_off + 3, &addr32, 4);
+                        printf("[ELF] 已修补 main 地址: 0x%x\n", addr32);
+                    }
+                }
+            }
+            fclose(fp2);
+        }
+    }
+
     printf("[xj380] ELF 加载完成, 入口=0x%llx\n", (unsigned long long)emu->entry_point);
     return 0;
 }
@@ -414,6 +482,7 @@ static const syscall_map_entry_t syscall_map[] = {
     /* Linux 标准 syscall (XJ380 复用) */
     {60,  XAPI_EXIT},              /* SYS_EXIT */
     {231, XAPI_EXIT},              /* SYS_EXIT_GROUP */
+    {228, -2},                    /* SYS_CLOCK_GETTIME → 特殊处理 */
 
     /* XJ380 XAPI syscall (基址 7380, 来自 libsys.h) */
     /* P3.1 文本 I/O */
@@ -536,6 +605,9 @@ static void xj380_syscall_hook(uc_engine *uc, uint64_t addr, uint32_t size, void
     (void)size;
     xj380_emu_t *emu = (xj380_emu_t*)user_data;
     uint64_t xj380_no = r(emu, UC_X86_REG_RAX);
+    fprintf(stderr, "  [HOOK] syscall @ 0x%llx RAX=0x%llx (%llu)\n",
+            (unsigned long long)addr, (unsigned long long)xj380_no,
+            (unsigned long long)xj380_no);
 
     /* Linux syscall ABI: arg4 在 R10, handler 期望在 RCX */
     uint64_t r10_val = r(emu, UC_X86_REG_R10);
@@ -551,6 +623,8 @@ static void xj380_syscall_hook(uc_engine *uc, uint64_t addr, uint32_t size, void
     /* 特殊 syscall: SYS_BRK (12) */
     if (xj380_no == 12) {
         h_SYSBRK(emu);
+    } else if (xj380_no == 228) {
+        h_CLOCKGETTIME(emu);
     } else {
         int internal_no = map_xj380_to_internal(xj380_no);
         if (internal_no >= 0 && internal_no < XAPI_COUNT && handlers[internal_no]) {
@@ -827,9 +901,9 @@ static void h_EXECVE(xj380_emu_t *e) {
 }
 static void h_EXIT(xj380_emu_t *e) {
     uint64_t v = r(e, UC_X86_REG_RDI);
-    e->running = false;
+    e->running  = false;
     e->exit_code = (int)v;
-    uc_emu_stop(e->uc);
+    /* 不调 uc_emu_stop——同线程内无效, 由 xj380_run 循环检测 running */
 }
 static void h_GETTASKLIST(xj380_emu_t *e) {
     uint64_t ba = r(e, UC_X86_REG_RDI); uint64_t mc = r(e, UC_X86_REG_RSI);
@@ -884,7 +958,7 @@ static void h_GETMEMORYSIZE(xj380_emu_t *e) { w(e, UC_X86_REG_RAX, 4096); }
 static void h_BROKEN(xj380_emu_t *e) {
     uint64_t a = r(e, UC_X86_REG_RDI); char b[4096];
     fprintf(stderr, "\n[崩溃] %s\n", xj380_mem_read_str(e, a, b, sizeof(b)) == 0 ? b : "(无信息)");
-    e->running = false; uc_emu_stop(e->uc);
+    e->running = false;
 }
 static void h_SENDAPPMESSAGE(xj380_emu_t *e) {
     uint64_t ta = r(e, UC_X86_REG_RDI), tx = r(e, UC_X86_REG_RSI);
@@ -956,6 +1030,21 @@ static void h_SYSBRK(xj380_emu_t *e) {
         e->brk_addr = new_brk;
     }
     w(e, UC_X86_REG_RAX, e->brk_addr);
+}
+
+/* SYS_CLOCK_GETTIME handler: clock_gettime(clockid, *timespec) */
+static void h_CLOCKGETTIME(xj380_emu_t *e) {
+    uint64_t tp = r(e, UC_X86_REG_RSI);  /* arg2 = timespec ptr */
+    if (tp) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        /* 写 timespec: { tv_sec(8), tv_nsec(8) } = 16 bytes */
+        uint64_t sec  = (uint64_t)ts.tv_sec;
+        uint64_t nsec = (uint64_t)ts.tv_nsec;
+        xj380_mem_write(e, tp,      &sec,  8);
+        xj380_mem_write(e, tp + 8,  &nsec, 8);
+    }
+    w(e, UC_X86_REG_RAX, 0);  /* 成功 */
 }
 
 static void h_MAPMEMORY(xj380_emu_t *e) {
@@ -1243,9 +1332,32 @@ void xj380_destroy(xj380_emu_t *emu)
     free(emu);
 }
 
-int xj380_run(xj380_emu_t *emu, int argc, char **argv)
+int xj380_run(xj380_emu_t *emu, int host_argc, char **host_argv)
 {
-    (void)argc; (void)argv;
+    /* 设置模拟程序的 argc/argv/envp */
+    uint64_t rsp = r(emu, UC_X86_REG_RSP);
+    (void)host_argc; (void)host_argv;
+
+    /* 在栈上分配 argv[1] 和 envp[1] (各 8 字节 + NULL) */
+    rsp -= 32;  /* 留空间 */
+    w(emu, UC_X86_REG_RSP, rsp);
+
+    /* argv[0] = 程序路径 (用于资源定位) */
+    const char *prog_name = host_argv ? host_argv[0] : "xswl-app";
+    uint64_t argv0_str = rsp + 16;
+    xj380_mem_write(emu, argv0_str, prog_name, strlen(prog_name) + 1);
+    uint64_t argv_array = rsp;
+    xj380_mem_write(emu, argv_array, &argv0_str, 8);     /* argv[0] */
+    uint64_t zero = 0;
+    xj380_mem_write(emu, argv_array + 8, &zero, 8);        /* argv[1] = NULL */
+
+    /* envp[0] = NULL */
+    uint64_t envp_array = argv_array + 16;
+    xj380_mem_write(emu, envp_array, &zero, 8);
+
+    w(emu, UC_X86_REG_RDI, 1);            /* argc = 1 */
+    w(emu, UC_X86_REG_RSI, argv_array);    /* argv */
+    w(emu, UC_X86_REG_RDX, envp_array);    /* envp */
     w(emu, UC_X86_REG_RIP, emu->entry_point);
     w(emu, UC_X86_REG_EFLAGS, 0x202);
     emu->running = true;
