@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 
 /* ================================================================
  * 常量
@@ -81,6 +82,7 @@ struct xj380_emu {
 
     /* 运行状态 */
     bool           running;
+    bool           debug_enabled;
     int            exit_code;
     uint64_t       arg7_value;
     bool           arg7_valid;
@@ -134,6 +136,25 @@ static inline uint64_t r(xj380_emu_t *emu, int reg)
 static inline void w(xj380_emu_t *emu, int reg, uint64_t val)
 {
     (void)uc_reg_write(emu->uc, reg, &val);
+}
+
+
+bool xj380_debug_enabled(const xj380_emu_t *emu)
+{
+    return !emu || emu->debug_enabled;
+}
+
+void xj380_log(xj380_emu_t *emu, const char *fmt, ...)
+{
+    if (!xj380_debug_enabled(emu))
+    {
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
 }
 
 typedef struct
@@ -602,7 +623,7 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
 
         for (int i = sn - 1; i >= 0; i--) {
             uint64_t sz = segs[i].e - segs[i].s;
-            printf("[ELF] LOAD [0x%llx-0x%llx] flags=%c%c%c\n",
+            xj380_log(emu, "[ELF] LOAD [0x%llx-0x%llx] flags=%c%c%c\n",
                    (unsigned long long)segs[i].s, (unsigned long long)segs[i].e,
                    (segs[i].p & UC_PROT_READ)  ? 'R' : '-',
                    (segs[i].p & UC_PROT_WRITE) ? 'W' : '-',
@@ -682,7 +703,7 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
 
         uint64_t scan_size = ph.p_memsz;
         if (scan_size > 0x800000) {  /* 8MB 上限, 足够覆盖大型二进制 */
-            fprintf(stderr, "[ELF] 警告: 段 0x%llx 超过扫描上限 (%llu > 8MB), "
+            xj380_log(emu, "[ELF] 警告: 段 0x%llx 超过扫描上限 (%llu > 8MB), "
                     "部分 syscall 可能未被拦截\n",
                     (unsigned long long)ph.p_vaddr,
                     (unsigned long long)scan_size);
@@ -706,7 +727,7 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
                                   (void*)xj380_syscall_hook, emu,
                                   saddr, saddr + 1);
                 _Pragma("GCC diagnostic pop")
-                printf("[ELF] 发现 syscall @ 0x%llx, 已注册 hook\n",
+                xj380_log(emu, "[ELF] 发现 syscall @ 0x%llx, 已注册 hook\n",
                        (unsigned long long)saddr);
             }
         }
@@ -768,7 +789,7 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
 
         /* 导出符号表（仅调试模式下打印） */
 #ifdef DEBUG_TRACE
-        printf("[xj380] xapi_%-20s @ 0x%llx (syscall #%d)\n",
+        xj380_log(emu, "[xj380] xapi_%-20s @ 0x%llx (syscall #%d)\n",
                xapi_names[i],
                (unsigned long long)(XJ380_TRAMP_BASE + (uint64_t)i * TRAMP_SLOT_SIZE), i);
 #else
@@ -842,7 +863,7 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
                         if (existing == 0) {
                             uint32_t addr32 = (uint32_t)main_addr;
                             xj380_mem_write(emu, patch_off + 3, &addr32, 4);
-                            printf("[ELF] 已修补 main 地址: 0x%x\n", addr32);
+                            xj380_log(emu, "[ELF] 已修补 main 地址: 0x%x\n", addr32);
                         }
                     }
                 }
@@ -852,7 +873,7 @@ int xj380_load_elf(xj380_emu_t *emu, const char *path)
         }
     }
 
-    printf("[xj380] ELF 加载完成, 入口=0x%llx\n", (unsigned long long)emu->entry_point);
+    xj380_log(emu, "[xj380] ELF 加载完成, 入口=0x%llx\n", (unsigned long long)emu->entry_point);
     return 0;
 }
 
@@ -993,7 +1014,7 @@ static void xj380_syscall_hook(uc_engine *uc, uint64_t addr, uint32_t size, void
 
     uint64_t xj380_no = r(emu, UC_X86_REG_RAX);
 #ifdef DEBUG_TRACE
-    fprintf(stderr, "  [HOOK] syscall @ 0x%llx RAX=0x%llx (%llu)\n",
+    xj380_log(emu, "  [HOOK] syscall @ 0x%llx RAX=0x%llx (%llu)\n",
             (unsigned long long)addr, (unsigned long long)xj380_no,
             (unsigned long long)xj380_no);
 #endif
@@ -1054,7 +1075,7 @@ static void debug_code_hook(uc_engine *uc, uint64_t addr, uint32_t size, void *u
 {
     (void)uc;
     (void)user_data;
-    fprintf(stderr, "  [TRACE] 0x%llx (%u bytes)\n", (unsigned long long)addr, size);
+    xj380_log((xj380_emu_t *)user_data, "  [TRACE] 0x%llx (%u bytes)\n", (unsigned long long)addr, size);
 }
 #endif
 
@@ -1112,7 +1133,9 @@ static void on_syscall(uc_engine *uc, uint32_t intno, void *user_data)
     (void)uc;
     (void)intno;
     (void)user_data;
-    fprintf(stderr, "  [SYSCALL FALLBACK]\n");
+#ifdef DEBUG_TRACE
+    xj380_log((xj380_emu_t *)user_data, "  [SYSCALL FALLBACK]\n");
+#endif
 }
 
 static bool invalid_mem_hook(uc_engine *uc, uc_mem_type type, uint64_t address,
@@ -1254,7 +1277,7 @@ static void h_OPENFILE(xj380_emu_t *e)
         return;
     }
 
-    printf("[xj380] OpenFile: %s\n", p);
+    xj380_log(e, "[xj380] OpenFile: %s\n", p);
 
     int idx = vfs_find(e, p);
     if (idx < 0)
@@ -1337,7 +1360,7 @@ static void h_CLOSEFILE(xj380_emu_t *e) {
     uint64_t len = 0, buf_ptr = 0, zero = 0;
     xj380_mem_read(e, a,      &len,     8);
     xj380_mem_read(e, a + 8,  &buf_ptr, 8);
-    printf("[xj380] CloseFile: len=%llu buf=0x%llx\n",
+    xj380_log(e, "[xj380] CloseFile: len=%llu buf=0x%llx\n",
            (unsigned long long)len, (unsigned long long)buf_ptr);
     /* 清零 XFILE 结构 */
     xj380_mem_write(e, a,      &zero, 8);
@@ -1368,12 +1391,12 @@ static void h_SEARCHFILE(xj380_emu_t *e) {
 static void h_MKDIR(xj380_emu_t *e) {
     uint64_t a = r(e, UC_X86_REG_RDI); char p[512];
     xj380_mem_read_str(e, a, p, sizeof(p)); vfs_create(e, p, true);
-    printf("[xj380] Mkdir: %s\n", p);
+    xj380_log(e, "[xj380] Mkdir: %s\n", p);
 }
 static void h_CREATEFILE(xj380_emu_t *e) {
     uint64_t a = r(e, UC_X86_REG_RDI); char p[512];
     xj380_mem_read_str(e, a, p, sizeof(p)); vfs_create(e, p, false);
-    printf("[xj380] CreateFile: %s\n", p);
+    xj380_log(e, "[xj380] CreateFile: %s\n", p);
 }
 static void h_DELETEFILE(xj380_emu_t *e) {
     uint64_t a = r(e, UC_X86_REG_RDI); char p[512];
@@ -1600,13 +1623,13 @@ static void h_SLEEP(xj380_emu_t *e) {
 static void h_RUN(xj380_emu_t *e) {
     uint64_t a = r(e, UC_X86_REG_RDI); char p[512];
     xj380_mem_read_str(e, a, p, sizeof(p));
-    printf("[xj380] Run: %s (不支持)\n", p);
+    xj380_log(e, "[xj380] Run: %s (不支持)\n", p);
 }
 static void h_RUNARGS(xj380_emu_t *e) {
     /* xapi_RunArgs(WSTR path, WSTR argv[]) — 同 h_RUN, 忽略参数 */
     uint64_t a = r(e, UC_X86_REG_RDI); char p[512];
     xj380_mem_read_str(e, a, p, sizeof(p));
-    printf("[xj380] RunArgs: %s (不支持)\n", p);
+    xj380_log(e, "[xj380] RunArgs: %s (不支持)\n", p);
 }
 static void h_SETMSGPRCOR(xj380_emu_t *e) {
     uint64_t handle = r(e, UC_X86_REG_RDI);
@@ -2047,6 +2070,7 @@ xj380_emu_t* xj380_create(void)
 {
     xj380_emu_t *emu = calloc(1, sizeof(*emu));
     if (!emu) return NULL;
+    emu->debug_enabled = true;
 
     uc_err err = uc_open(UC_ARCH_X86, UC_MODE_64, &emu->uc);
     if (err != UC_ERR_OK) {
@@ -2104,6 +2128,19 @@ xj380_emu_t* xj380_create(void)
     return emu;
 }
 
+void xj380_set_debug(xj380_emu_t *emu, bool enabled)
+{
+    if (!emu)
+    {
+        return;
+    }
+
+    emu->debug_enabled = enabled;
+#ifdef XJ380_GUI
+    xj380_gui_set_debug(enabled);
+#endif
+}
+
 void xj380_destroy(xj380_emu_t *emu)
 {
     if (!emu) return;
@@ -2145,7 +2182,7 @@ int xj380_run(xj380_emu_t *emu, int host_argc, char **host_argv)
     w(emu, UC_X86_REG_EFLAGS, 0x202);
     emu->running = true;
 
-    printf("[xj380] ▶ 开始执行 @ 0x%llx\n", (unsigned long long)emu->entry_point);
+    xj380_log(emu, "[xj380] ▶ 开始执行 @ 0x%llx\n", (unsigned long long)emu->entry_point);
 
 #ifdef XJ380_GUI
     /* GUI 模式: 时间分片执行，每 50000 条指令切出来处理事件 */

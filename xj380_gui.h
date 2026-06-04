@@ -14,6 +14,7 @@ extern "C" {
 /* SDL2 初始化/清理 */
 int  xj380_gui_init(void);
 void xj380_gui_cleanup(void);
+void xj380_gui_set_debug(bool enabled);
 
 /* 窗口 */
 void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwin_ptr);

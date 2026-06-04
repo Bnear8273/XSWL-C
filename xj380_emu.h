@@ -116,6 +116,9 @@ typedef struct xj380_emu xj380_emu_t;
 /* 创建/销毁模拟器实例 */
 xj380_emu_t* xj380_create(void);
 void         xj380_destroy(xj380_emu_t *emu);
+void         xj380_set_debug(xj380_emu_t *emu, bool enabled);
+bool         xj380_debug_enabled(const xj380_emu_t *emu);
+void         xj380_log(xj380_emu_t *emu, const char *fmt, ...);
 
 /* 加载 ELF/EPF 二进制 */
 int  xj380_load_elf(xj380_emu_t *emu, const char *path);

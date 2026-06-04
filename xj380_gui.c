@@ -42,6 +42,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <limits.h>
+#include <stdarg.h>
 
 /* ================================================================
  * GUI 窗口结构
@@ -92,6 +93,7 @@ static gui_window_t *g_windows[MAX_GUI_WINDOWS];
 static int            g_window_count;
 static uint64_t       g_next_handle = 1;
 static bool           g_sdl_initialized;
+static bool           g_gui_debug_enabled = true;
 static bool           g_test_events_enabled;
 static bool           g_test_events_pushed;
 
@@ -132,6 +134,24 @@ static cached_font_t* find_font(const char *path)
 /* ================================================================
  * SDL2 初始化
  * ================================================================ */
+void xj380_gui_set_debug(bool enabled)
+{
+    g_gui_debug_enabled = enabled;
+}
+
+static void gui_log(const char *fmt, ...)
+{
+    if (!g_gui_debug_enabled)
+    {
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
 int xj380_gui_init(void)
 {
     if (g_sdl_initialized) return 0;
@@ -147,7 +167,7 @@ int xj380_gui_init(void)
     SDL_StartTextInput();
 
     g_sdl_initialized = true;
-    printf("[GUI] SDL2 初始化完成\n");
+    gui_log("[GUI] SDL2 初始化完成\n");
     return 0;
 }
 
@@ -316,7 +336,7 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
     /* 写 handle 回模拟器内存 */
     xj380_mem_write(emu, handle_ptr, &gw->handle, 8);
 
-    printf("[GUI] 创建窗口 #%llu: %dx%d \"%s\"\n",
+    gui_log("[GUI] 创建窗口 #%llu: %dx%d \"%s\"\n",
            (unsigned long long)gw->handle, gw->width, gw->height, gw->title);
 }
 
@@ -336,7 +356,7 @@ void xj380_gui_close_window(xj380_emu_t *emu, uint64_t handle)
             /* 从数组中移除 */
             g_windows[i] = g_windows[--g_window_count];
             g_windows[g_window_count] = NULL;
-            printf("[GUI] 关闭窗口 #%llu\n", (unsigned long long)handle);
+            gui_log("[GUI] 关闭窗口 #%llu\n", (unsigned long long)handle);
             return;
         }
     }
@@ -1217,7 +1237,7 @@ void xj380_gui_load_font(const char *vpath, const uint8_t *data, size_t size)
     }
     cf->scale = stbtt_ScaleForPixelHeight(&cf->info, 16.0f);
     g_font_count++;
-    printf("[GUI] 字体加载: %s (%zu bytes)\n", vpath, size);
+    gui_log("[GUI] 字体加载: %s (%zu bytes)\n", vpath, size);
 }
 
 void xj380_gui_store_callback(xj380_emu_t *emu, uint64_t handle, uint64_t func)
@@ -1226,7 +1246,7 @@ void xj380_gui_store_callback(xj380_emu_t *emu, uint64_t handle, uint64_t func)
     gui_window_t *gw = find_window(handle);
     if (gw) {
         gw->msg_callback_addr = func;
-        printf("[GUI] SetMsgPrcor: handle=0x%llx func=0x%llx\n",
+        gui_log("[GUI] SetMsgPrcor: handle=0x%llx func=0x%llx\n",
                (unsigned long long)handle, (unsigned long long)func);
     }
 }
