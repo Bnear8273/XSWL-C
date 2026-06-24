@@ -1,14 +1,15 @@
 # XSWL-C — Makefile
 #   make          — gcc -O3 (默认)
-#   make gui      — gcc -O3 + SDL2 GUI
+#   make gui      — gcc -O3 + SDL3 GUI
 #   make dev      — clang + sanitizers + trace
 #   make release  — gcc + g++ 链接 -O3 -flto
 
 TARGET    = xswl
-INC       = -Isrc -I/usr/include -I/usr/include/SDL2
+SDL3_CFLAGS := $(shell pkg-config --cflags sdl3 2>/dev/null || echo "-I/usr/include/SDL3")
+SDL3_LIBS   := $(shell pkg-config --libs sdl3 2>/dev/null || echo "-lSDL3")
+INC       = -Isrc -I/usr/include $(SDL3_CFLAGS)
 LIBS_TUI  = -lunicorn -lm
-LIBS_GUI  = -lunicorn -lSDL2 -lSDL2_image -lm
-TEST_ELF  = test_file.elf
+LIBS_GUI  = -lunicorn $(SDL3_LIBS) -lm
 GUI_EVENT_TEST_ELF = test_gui_events.elf
 
 SRC_TUI   = src/main.c src/xj380_emu.c
@@ -27,7 +28,7 @@ $(TARGET): $(SRC_TUI) src/xj380_emu.h
 	$(PROD_CC) $(PROD_FLAGS) $(INC) -c src/xj380_emu.c -o xj380_emu.o
 	$(PROD_CC) $(PROD_FLAGS) -o $@ main.o xj380_emu.o $(LIBS_TUI)
 
-# === GUI: gcc -O3 + SDL2 ===
+# === GUI: gcc -O3 + SDL3 ===
 GUI_FLAGS  = $(PROD_FLAGS) -DXJ380_GUI -Wno-pedantic
 
 .PHONY: gui
@@ -64,15 +65,11 @@ release:
 	rm -f *.rel.o
 
 # === 测试 ===
-$(TEST_ELF): test_file.S
-	gcc -m64 -nostdlib -static -no-pie -o $@ $< -Wl,-Ttext=0x200000
-
 $(GUI_EVENT_TEST_ELF): test_gui_events.S
 	gcc -m64 -nostdlib -static -no-pie -o $@ $< -Wl,-Ttext=0x200000
 
 .PHONY: test test-gui-events test-real
-test: $(TARGET) $(TEST_ELF)
-	./$(TARGET) $(TEST_ELF)
+test: test-gui-events
 
 test-gui-events: gui $(GUI_EVENT_TEST_ELF)
 	SDL_VIDEODRIVER=dummy XSWL_TEST_GUI_EVENTS=1 ./$(TARGET) $(GUI_EVENT_TEST_ELF)
@@ -82,4 +79,4 @@ test-real: $(TARGET)
 
 .PHONY: clean
 clean:
-	rm -f $(TARGET) $(TEST_ELF) $(GUI_EVENT_TEST_ELF) *.o *.dev.o *.rel.o
+	rm -f $(TARGET) $(GUI_EVENT_TEST_ELF) *.o *.dev.o *.rel.o

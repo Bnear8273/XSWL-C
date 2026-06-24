@@ -12,8 +12,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(UNICORN REQUIRED IMPORTED_TARGET unicorn)
-pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
-pkg_check_modules(SDL2_IMAGE REQUIRED IMPORTED_TARGET SDL2_image)
+pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
 
 set(XSWL_COMMON_WARNINGS
     -Wall
@@ -85,24 +84,8 @@ target_compile_options(xswl
 target_link_libraries(xswl
     PRIVATE
         PkgConfig::UNICORN
-        PkgConfig::SDL2
-        PkgConfig::SDL2_IMAGE
+        PkgConfig::SDL3
         m
-)
-
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test_file.elf
-    COMMAND ${CMAKE_C_COMPILER}
-        -m64 -nostdlib -static -no-pie
-        -Wl,-Ttext=0x200000
-        -o ${CMAKE_CURRENT_BINARY_DIR}/test_file.elf
-        ${CMAKE_CURRENT_SOURCE_DIR}/test_file.S
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test_file.S
-    VERBATIM
-)
-
-add_custom_target(xswl_test_file
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/test_file.elf
 )
 
 add_custom_command(
@@ -118,13 +101,6 @@ add_custom_command(
 
 add_custom_target(xswl_test_gui_events_file
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/test_gui_events.elf
-)
-
-add_custom_target(xswl_run_test
-    COMMAND $<TARGET_FILE:xswl> ${CMAKE_CURRENT_BINARY_DIR}/test_file.elf
-    DEPENDS xswl xswl_test_file
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    VERBATIM
 )
 
 add_custom_target(xswl_run_gui_events

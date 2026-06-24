@@ -1,20 +1,19 @@
 /*
- * xj380_gui.c — XJ380 GUI 后端 (SDL2)
+ * xj380_gui.c — XJ380 GUI 后端 (SDL3)
  *
  * 实现 XJ380 API 手册 Chapter 4 的图形化函数:
  *   窗口管理, 绘图, 图片, framebuffer, 控件, 消息处理
  *
  * 线程模型:
- *   模拟器主线程在 uc_emu_start() 阻塞执行, 但 SDL2 需要在主线程处理事件。
- *   方案: 在 xj380_run 中用 SDL_PollEvent 交替驱动 SDL2 和 Unicorn。
+ *   模拟器主线程在 uc_emu_start() 阻塞执行, 但 SDL3 需要在主线程处理事件。
+ *   方案: 在 xj380_run 中用 SDL_PollEvent 交替驱动 SDL3 和 Unicorn。
  *   当 xapi_CreateWindow 被调用时, 创建 SDL 窗口并切换到事件驱动模式。
  */
 
 #include "xj380_emu.h"
 #include "xj380_gui.h"
 
-#include <SDL.h>
-#include <SDL_image.h>
+#include <SDL3/SDL.h>
 #include <unicorn/unicorn.h>
 #include <unicorn/x86.h>
 
@@ -43,6 +42,11 @@
 #include <pthread.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <strings.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 /* ================================================================
  * GUI 窗口结构
@@ -229,10 +233,10 @@ static SDL_Surface *load_image_surface(xj380_emu_t *emu, const char *path)
 
     if (xj380_vfs_read_file(emu, path, &data, &size) == 0 && data && size > 0)
     {
-        SDL_RWops *rw = SDL_RWFromConstMem(data, (int)size);
-        if (rw)
+        SDL_IOStream *io = SDL_IOFromConstMem(data, size);
+        if (io)
         {
-            SDL_Surface *surf = IMG_Load_RW(rw, 1);
+            SDL_Surface *surf = SDL_LoadSurface_IO(io, true);
             if (surf)
             {
                 return surf;
@@ -240,10 +244,10 @@ static SDL_Surface *load_image_surface(xj380_emu_t *emu, const char *path)
         }
     }
 
-    SDL_Surface *surf = IMG_Load(path);
+    SDL_Surface *surf = SDL_LoadSurface(path);
     if (!surf && path[0] == '/')
     {
-        surf = IMG_Load(path + 1);
+        surf = SDL_LoadSurface(path + 1);
     }
 
     return surf;
@@ -252,7 +256,7 @@ static SDL_Surface *load_image_surface(xj380_emu_t *emu, const char *path)
 
 
 /* ================================================================
- * SDL2 初始化
+ * SDL3 初始化
  * ================================================================ */
 void xj380_gui_set_debug(bool enabled)
 {
@@ -276,18 +280,16 @@ int xj380_gui_init(void)
 {
     if (g_sdl_initialized) return 0;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         fprintf(stderr, "[GUI] SDL_Init failed: %s\n", SDL_GetError());
         return -1;
     }
 
-    IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG);
     g_test_events_enabled = getenv("XSWL_TEST_GUI_EVENTS") != NULL;
     g_test_events_pushed = false;
-    SDL_StartTextInput();
 
     g_sdl_initialized = true;
-    gui_log("[GUI] SDL2 initialized\n");
+    gui_log("[GUI] SDL3 initialized\n");
     return 0;
 }
 
@@ -298,14 +300,15 @@ void xj380_gui_cleanup(void)
         if (gw->fb)    free(gw->fb);
         if (gw->tex)   SDL_DestroyTexture(gw->tex);
         if (gw->rend)  SDL_DestroyRenderer(gw->rend);
-        if (gw->win)   SDL_DestroyWindow(gw->win);
+        if (gw->win) {
+            SDL_StopTextInput(gw->win);
+            SDL_DestroyWindow(gw->win);
+        }
         free(gw);
     }
     g_window_count = 0;
 
     if (g_sdl_initialized) {
-        SDL_StopTextInput();
-        IMG_Quit();
         SDL_Quit();
         g_sdl_initialized = false;
     }
@@ -360,9 +363,9 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
     if (title[0] == 0) strcpy(title, "XJ380 Application");
 
     /* 创建 SDL 窗口 */
-    uint32_t sdl_flags = SDL_WINDOW_SHOWN;
+    SDL_WindowFlags sdl_flags = 0;
     if (sets & XWIN_FULL_SCR) {
-        sdl_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+        sdl_flags |= SDL_WINDOW_FULLSCREEN;
     } else if (sets & XWIN_FRAME_OFF) {
         sdl_flags |= SDL_WINDOW_BORDERLESS;
     }
@@ -370,9 +373,7 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
         sdl_flags |= SDL_WINDOW_RESIZABLE;
     }
 
-    SDL_Window *win = SDL_CreateWindow(title,
-        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-        (int)width, (int)height, sdl_flags);
+    SDL_Window *win = SDL_CreateWindow(title, (int)width, (int)height, sdl_flags);
 
     if (!win) {
         fprintf(stderr, "[GUI] SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -382,18 +383,7 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
         return;
     }
 
-    uint32_t renderer_flags = SDL_RENDERER_ACCELERATED;
-    const char *vsync_env = getenv("XSWL_VSYNC");
-    if (vsync_env && strcmp(vsync_env, "0") != 0)
-    {
-        renderer_flags |= SDL_RENDERER_PRESENTVSYNC;
-    }
-
-    SDL_Renderer *rend = SDL_CreateRenderer(win, -1, renderer_flags);
-    if (!rend)
-    {
-        rend = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
-    }
+    SDL_Renderer *rend = SDL_CreateRenderer(win, NULL);
     if (!rend)
     {
         fprintf(stderr, "[GUI] SDL_CreateRenderer failed: %s\n", SDL_GetError());
@@ -401,6 +391,11 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
         uint64_t zero = 0;
         xj380_mem_write(emu, handle_ptr, &zero, 8);
         return;
+    }
+    const char *vsync_env = getenv("XSWL_VSYNC");
+    if (vsync_env && strcmp(vsync_env, "0") != 0)
+    {
+        SDL_SetRenderVSync(rend, 1);
     }
 
     SDL_Texture *tex = SDL_CreateTexture(rend,
@@ -456,6 +451,7 @@ void xj380_gui_create_window(xj380_emu_t *emu, uint64_t handle_ptr, uint64_t xwi
     gw->dirty      = true;
     gw->dirty_rect = (SDL_Rect){0, 0, gw->width, gw->height};
     copy_cstr(gw->title, sizeof(gw->title), title);
+    SDL_StartTextInput(win);
 
     g_windows[g_window_count++] = gw;
 
@@ -477,7 +473,10 @@ void xj380_gui_close_window(xj380_emu_t *emu, uint64_t handle)
             if (gw->fb)   free(gw->fb);
             if (gw->tex)  SDL_DestroyTexture(gw->tex);
             if (gw->rend) SDL_DestroyRenderer(gw->rend);
-            if (gw->win)  SDL_DestroyWindow(gw->win);
+            if (gw->win) {
+                SDL_StopTextInput(gw->win);
+                SDL_DestroyWindow(gw->win);
+            }
             free(gw);
             /* 从数组中移除 */
             g_windows[i] = g_windows[--g_window_count];
@@ -613,7 +612,7 @@ static void mark_dirty(gui_window_t *gw, int x, int y, int w, int h)
         return;
     }
 
-    SDL_UnionRect(&gw->dirty_rect, &clipped, &gw->dirty_rect);
+    SDL_GetRectUnion(&gw->dirty_rect, &clipped, &gw->dirty_rect);
 }
 
 static void set_pixel_raw(gui_window_t *gw, int x, int y, uint32_t rgba)
@@ -873,15 +872,14 @@ void xj380_gui_draw_bmp(xj380_emu_t *emu, uint64_t handle,
         return;
     }
 
-    SDL_Surface *scaled = SDL_CreateRGBSurfaceWithFormat(0,
-        (int)w, (int)h, 32, SDL_PIXELFORMAT_ARGB8888);
+    SDL_Surface *scaled = SDL_CreateSurface((int)w, (int)h, SDL_PIXELFORMAT_ARGB8888);
     if (!scaled)
     {
-        SDL_FreeSurface(surf);
+        SDL_DestroySurface(surf);
         return;
     }
 
-    SDL_BlitScaled(surf, NULL, scaled, NULL);
+    SDL_BlitSurfaceScaled(surf, NULL, scaled, NULL, SDL_SCALEMODE_LINEAR);
 
     uint8_t *pixels = (uint8_t *)scaled->pixels;
     for (int row = 0; row < rect.h; row++)
@@ -894,21 +892,21 @@ void xj380_gui_draw_bmp(xj380_emu_t *emu, uint64_t handle,
     }
 
     mark_dirty(gw, rect.x, rect.y, rect.w, rect.h);
-    SDL_FreeSurface(scaled);
-    SDL_FreeSurface(surf);
+    SDL_DestroySurface(scaled);
+    SDL_DestroySurface(surf);
 }
 
 void xj380_gui_draw_png(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t path_ptr)
 {
-    /* IMG_Load 同样支持 PNG */
+    /* SDL3 内置加载器支持 BMP/PNG。 */
     xj380_gui_draw_bmp(emu, handle, x, y, w, h, path_ptr);
 }
 
 void xj380_gui_draw_picture(xj380_emu_t *emu, uint64_t handle,
     uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint64_t path_ptr)
 {
-    /* IMG_Load 支持 PNG/BMP/JPEG/GIF */
+    /* SDL3 内置加载器支持 BMP/PNG；其它格式需要额外解码库。 */
     xj380_gui_draw_bmp(emu, handle, x, y, w, h, path_ptr);
 }
 
@@ -1031,7 +1029,7 @@ void xj380_gui_refresh_window(xj380_emu_t *emu, uint64_t handle)
         gw->fb + rect.y * gw->width + rect.x,
         gw->width * (int)sizeof(uint32_t));
     SDL_RenderClear(gw->rend);
-    SDL_RenderCopy(gw->rend, gw->tex, NULL, NULL);
+    SDL_RenderTexture(gw->rend, gw->tex, NULL, NULL);
     SDL_RenderPresent(gw->rend);
     gw->dirty = false;
 }
@@ -1059,7 +1057,7 @@ void xj380_gui_refresh_part(xj380_emu_t *emu, uint64_t handle,
         gw->fb + rect.y * gw->width + rect.x,
         gw->width * (int)sizeof(uint32_t));
     SDL_RenderClear(gw->rend);
-    SDL_RenderCopy(gw->rend, gw->tex, NULL, NULL);
+    SDL_RenderTexture(gw->rend, gw->tex, NULL, NULL);
     SDL_RenderPresent(gw->rend);
     gw->dirty = false;
 }
@@ -1136,12 +1134,12 @@ static void queue_event(uint64_t handle, uint64_t type, uint64_t hData, uint64_t
 
 static int sdl_key_to_ascii(SDL_Keycode sym, SDL_Keymod mod)
 {
-    bool shift = (mod & KMOD_SHIFT) != 0;
-    bool caps = (mod & KMOD_CAPS) != 0;
+    bool shift = (mod & SDL_KMOD_SHIFT) != 0;
+    bool caps = (mod & SDL_KMOD_CAPS) != 0;
 
-    if (sym >= SDLK_a && sym <= SDLK_z)
+    if (sym >= SDLK_A && sym <= SDLK_Z)
     {
-        int ch = 'a' + (int)(sym - SDLK_a);
+        int ch = 'a' + (int)(sym - SDLK_A);
         if (shift != caps)
         {
             ch = ch - 'a' + 'A';
@@ -1164,11 +1162,11 @@ static int sdl_key_to_ascii(SDL_Keycode sym, SDL_Keymod mod)
     case SDLK_RIGHTBRACKET: return shift ? '}' : ']';
     case SDLK_BACKSLASH: return shift ? '|' : '\\';
     case SDLK_SEMICOLON: return shift ? ':' : ';';
-    case SDLK_QUOTE: return shift ? '"' : '\'';
+    case SDLK_APOSTROPHE: return shift ? '"' : '\'';
     case SDLK_COMMA: return shift ? '<' : ',';
     case SDLK_PERIOD: return shift ? '>' : '.';
     case SDLK_SLASH: return shift ? '?' : '/';
-    case SDLK_BACKQUOTE: return shift ? '~' : '`';
+    case SDLK_GRAVE: return shift ? '~' : '`';
     default: return -1;
     }
 }
@@ -1270,15 +1268,17 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
         /* 找到事件对应的窗口 */
         Uint32 winID = 0;
         switch (ev.type) {
-        case SDL_WINDOWEVENT: winID = ev.window.windowID; break;
-        case SDL_MOUSEBUTTONDOWN:
-        case SDL_MOUSEBUTTONUP:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        case SDL_EVENT_WINDOW_RESIZED:
+            winID = ev.window.windowID; break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
             winID = ev.button.windowID; break;
-        case SDL_MOUSEMOTION: winID = ev.motion.windowID; break;
-        case SDL_MOUSEWHEEL:  winID = ev.wheel.windowID; break;
-        case SDL_KEYDOWN:
-        case SDL_KEYUP:       winID = ev.key.windowID; break;
-        case SDL_TEXTINPUT:   winID = ev.text.windowID; break;
+        case SDL_EVENT_MOUSE_MOTION: winID = ev.motion.windowID; break;
+        case SDL_EVENT_MOUSE_WHEEL:  winID = ev.wheel.windowID; break;
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP:       winID = ev.key.windowID; break;
+        case SDL_EVENT_TEXT_INPUT:   winID = ev.text.windowID; break;
         default: break;
         }
 
@@ -1289,21 +1289,23 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
                 break;
             }
         }
-        if (!gw && ev.type != SDL_QUIT) continue;
+        if (!gw && ev.type != SDL_EVENT_QUIT) continue;
 
         switch (ev.type) {
 
         /* ---- 窗口事件 ---- */
-        case SDL_WINDOWEVENT:
-            switch (ev.window.event) {
-            case SDL_WINDOWEVENT_CLOSE:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
                 gw->open = false;
                 if (gw->fb)   { free(gw->fb);   gw->fb   = NULL; }
                 if (gw->tex)  { SDL_DestroyTexture(gw->tex);  gw->tex  = NULL; }
                 if (gw->rend) { SDL_DestroyRenderer(gw->rend); gw->rend = NULL; }
-                if (gw->win)  { SDL_DestroyWindow(gw->win);   gw->win  = NULL; }
+                if (gw->win)  {
+                    SDL_StopTextInput(gw->win);
+                    SDL_DestroyWindow(gw->win);
+                    gw->win  = NULL;
+                }
                 return 2;  /* 通知调用者: 窗口被用户关闭 */
-            case SDL_WINDOWEVENT_RESIZED:
+        case SDL_EVENT_WINDOW_RESIZED:
             {
                 int new_width  = ev.window.data1;
                 int new_height = ev.window.data2;
@@ -1349,21 +1351,19 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
                 queue_event(gw->handle, XJ380_MSG_RESIZE, 0, 0);
                 break;
             }
-            }
-            break;
 
         /* ---- 鼠标移动 ---- */
-        case SDL_MOUSEMOTION:
+        case SDL_EVENT_MOUSE_MOTION:
             queue_event(gw->handle, XJ380_MSG_MOVE,
-                        (uint64_t)ev.motion.x, (uint64_t)ev.motion.y);
+                        (uint64_t)(uint32_t)ev.motion.x, (uint64_t)(uint32_t)ev.motion.y);
             break;
 
         /* ---- 鼠标按键: XJ380 在释放时发送一次点击手势 ---- */
-        case SDL_MOUSEBUTTONUP:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
             switch (ev.button.button) {
             case SDL_BUTTON_LEFT:
                 queue_event(gw->handle, XJ380_MSG_LBUTTON,
-                    (uint64_t)ev.button.x, (uint64_t)ev.button.y);
+                    (uint64_t)(uint32_t)ev.button.x, (uint64_t)(uint32_t)ev.button.y);
                 /* 检查按钮点击 */
                 for (int i = 0; i < gw->button_count; i++) {
                     if (!gw->buttons[i].alive) continue;
@@ -1378,25 +1378,25 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
                 break;
             case SDL_BUTTON_RIGHT:
                 queue_event(gw->handle, XJ380_MSG_RBUTTON,
-                    (uint64_t)ev.button.x, (uint64_t)ev.button.y);
+                    (uint64_t)(uint32_t)ev.button.x, (uint64_t)(uint32_t)ev.button.y);
                 break;
             case SDL_BUTTON_MIDDLE:
                 queue_event(gw->handle, XJ380_MSG_MBUTTON,
-                    (uint64_t)ev.button.x, (uint64_t)ev.button.y);
+                    (uint64_t)(uint32_t)ev.button.x, (uint64_t)(uint32_t)ev.button.y);
                 break;
             }
             break;
 
         /* ---- 鼠标滚轮 ---- */
-        case SDL_MOUSEWHEEL:
+        case SDL_EVENT_MOUSE_WHEEL:
             queue_event(gw->handle, XJ380_MSG_ROLLER,
-                ((uint64_t)(uint32_t)ev.wheel.mouseX << 32) |
-                ((uint64_t)(uint32_t)ev.wheel.mouseY),
+                ((uint64_t)(uint32_t)ev.wheel.mouse_x << 32) |
+                ((uint64_t)(uint32_t)ev.wheel.mouse_y),
                 (uint64_t)(int64_t)ev.wheel.y);
             break;
 
         /* ---- 键盘: 字符输入 ---- */
-        case SDL_TEXTINPUT:
+        case SDL_EVENT_TEXT_INPUT:
         {
             const char *p = ev.text.text;
             while (*p)
@@ -1425,8 +1425,8 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
         }
 
         /* ---- 键盘: 特殊键 ---- */
-        case SDL_KEYDOWN: {
-            int key = sdl_key_to_xj380_key(ev.key.keysym.sym, ev.key.keysym.mod);
+        case SDL_EVENT_KEY_DOWN: {
+            int key = sdl_key_to_xj380_key(ev.key.key, ev.key.mod);
             if (key >= 0)
             {
                 queue_event(gw->handle, XJ380_MSG_KEYDOWN, 0, (uint64_t)(uint8_t)key);
@@ -1444,8 +1444,8 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
             break;
         }
 
-        case SDL_KEYUP: {
-            int key = sdl_key_to_xj380_key(ev.key.keysym.sym, ev.key.keysym.mod);
+        case SDL_EVENT_KEY_UP: {
+            int key = sdl_key_to_xj380_key(ev.key.key, ev.key.mod);
             if (key >= 0)
             {
                 queue_event(gw->handle, XJ380_MSG_KEYUP, 0, (uint64_t)(uint8_t)key);
@@ -1453,7 +1453,7 @@ int xj380_gui_poll_events(xj380_emu_t *emu)
             break;
         }
 
-        case SDL_QUIT:
+        case SDL_EVENT_QUIT:
             return 1;
         }
     }
@@ -1592,7 +1592,7 @@ int xj380_gui_window_count(void)
 void xj380_gui_set_icon(xj380_emu_t *emu, uint64_t handle, uint64_t path_ptr)
 {
     (void)emu; (void)handle; (void)path_ptr;
-    /* SDL2 设置窗口图标需要 SDL_Surface, 暂略 */
+    /* SDL3 设置窗口图标需要 SDL_Surface, 暂略 */
 }
 
 void xj380_gui_get_window_size(xj380_emu_t *emu, uint64_t handle,
@@ -1649,7 +1649,7 @@ void xj380_gui_get_pic_size(xj380_emu_t *emu, uint64_t path_ptr,
         uint32_t w = (uint32_t)s->w, h = (uint32_t)s->h;
         if (width_ptr)  xj380_mem_write(emu, width_ptr,  &w, 4);
         if (height_ptr) xj380_mem_write(emu, height_ptr, &h, 4);
-        SDL_FreeSurface(s);
+        SDL_DestroySurface(s);
     }
 }
 

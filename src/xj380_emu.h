@@ -1,8 +1,8 @@
 /*
- * xj380_emu.h — XJ380 高性能二进制模拟器 (Unicorn C API + SDL2)
+ * xj380_emu.h — XJ380 高性能二进制模拟器 (Unicorn C API + SDL3)
  *
  * 模拟 XJ380 操作系统的核心环境：ELF 加载、xapi 系统调用、
- * 虚拟文件系统、GUI 渲染（通过 SDL2）。
+ * 虚拟文件系统、GUI 渲染（通过 SDL3）。
  *
  * 无 Python 层, 全路径 C 级别直通。
  */
@@ -126,7 +126,7 @@ int  xj380_load_elf(xj380_emu_t *emu, const char *path);
 /* 运行（阻塞直到程序退出） */
 int  xj380_run(xj380_emu_t *emu, int argc, char **argv);
 
-/* 注册 GUI 渲染回调（可选，不设置则用内置 SDL2 后端） */
+/* 注册 GUI 渲染回调（可选，不设置则用内置 SDL3 后端） */
 typedef void (*xj380_render_cb)(void *window, int w, int h);
 void xj380_set_render_callback(xj380_emu_t *emu, xj380_render_cb cb);
 

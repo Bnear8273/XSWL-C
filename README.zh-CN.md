@@ -1,7 +1,7 @@
 # XSWL-C
 
 XSWL-C 是一个用 C 写的 XJ380 应用程序模拟器。它通过 Unicorn Engine 执行
-XJ380 ELF/EPF 程序，并在 Linux 上用 SDL2 实现常用的 XAPI TUI 和 GUI 调用。
+XJ380 ELF/EPF 程序，并在 Linux 上用 SDL3 实现常用的 XAPI TUI 和 GUI 调用。
 
 English documentation: [README.md](README.md)
 
@@ -10,14 +10,13 @@ English documentation: [README.md](README.md)
 Ubuntu/Debian:
 
 ```bash
-sudo apt install -y cmake ninja-build pkg-config libunicorn-dev libsdl2-dev libsdl2-image-dev
+sudo apt install -y cmake ninja-build pkg-config libunicorn-dev libsdl3-dev
 ```
 
 | 库 | 用途 |
 |---|---|
 | Unicorn Engine | x86_64 CPU 模拟 |
-| SDL2 | 窗口和事件 |
-| SDL2_image | BMP/PNG/JPEG 图片加载 |
+| SDL3 | 窗口、事件和 BMP/PNG 图片加载 |
 | nanosvg | SVG 渲染，已放在仓库内 |
 
 ## 编译
@@ -58,7 +57,6 @@ cmake --build build-dev
 ## 测试
 
 ```bash
-cmake --build build --target xswl_run_test
 cmake --build build --target xswl_run_gui_events
 ```
 

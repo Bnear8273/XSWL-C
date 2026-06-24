@@ -1624,7 +1624,7 @@ static void h_SENDAPPMESSAGE(xj380_emu_t *e) {
 static void h_SLEEP(xj380_emu_t *e) {
     uint64_t ms = r(e, UC_X86_REG_RDI);
 #ifdef XJ380_GUI
-    /* GUI 模式下不能真睡: 必须边等边轮询 SDL2 事件。
+    /* GUI 模式下不能真睡: 必须边等边轮询 SDL3 事件。
      * 使用基于时间的循环避免长时间 ms 的 O(n) 迭代 */
     {
         struct timespec start, now;
@@ -1883,7 +1883,7 @@ static void h_MAPMEMORY(xj380_emu_t *e)
 
 /* handler 表 */
 #ifdef XJ380_GUI
-/* ---- GUI handler stubs (调用 SDL2 后端) ---- */
+/* ---- GUI handler stubs (调用 SDL3 后端) ---- */
 
 static uint64_t current_arg7(xj380_emu_t *emu)
 {

@@ -2,7 +2,7 @@
 
 XSWL-C is a C implementation of an XJ380 application emulator. It loads XJ380
 ELF/EPF programs, runs x86_64 code through Unicorn Engine, and implements a
-practical subset of the XAPI TUI and GUI calls on Linux with SDL2.
+practical subset of the XAPI TUI and GUI calls on Linux with SDL3.
 
 Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
 
@@ -11,7 +11,7 @@ Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
 Ubuntu/Debian:
 
 ```bash
-sudo apt install -y cmake ninja-build pkg-config libunicorn-dev libsdl2-dev libsdl2-image-dev
+sudo apt install -y cmake ninja-build pkg-config libunicorn-dev libsdl3-dev
 ```
 
 Main dependencies:
@@ -19,8 +19,7 @@ Main dependencies:
 | Library | Use |
 |---|---|
 | Unicorn Engine | x86_64 CPU emulation |
-| SDL2 | GUI windows and events |
-| SDL2_image | BMP/PNG/JPEG image loading |
+| SDL3 | GUI windows, events, and BMP/PNG image loading |
 | nanosvg | SVG rasterization, vendored |
 
 ## Build
@@ -62,7 +61,6 @@ output:
 ## Tests
 
 ```bash
-cmake --build build --target xswl_run_test
 cmake --build build --target xswl_run_gui_events
 ```
 

@@ -1,5 +1,5 @@
 /*
- * xj380_gui.h — XJ380 GUI 后端 (SDL2)
+ * xj380_gui.h — XJ380 GUI 后端 (SDL3)
  */
 #ifndef XJ380_GUI_H
 #define XJ380_GUI_H
@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-/* SDL2 初始化/清理 */
+/* SDL3 初始化/清理 */
 int  xj380_gui_init(void);
 void xj380_gui_cleanup(void);
 void xj380_gui_set_debug(bool enabled);
